@@ -1,0 +1,17 @@
+{
+  "name": "spotify-web-api",
+  "displayName": "Spotify",
+  "version": "0.1.1",
+  "description": "Integrate and consume the APIMatic-generated Spotify Web API SDK — bundled skills for C#/.NET, Python and TypeScript.",
+  "author": {
+    "name": "MuHamza30",
+    "email": "muhammad.hamza@apimatic.io"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/MuHamza30/spotify-web-api-plugin",
+  "skills": [
+    "./skills/dotnet",
+    "./skills/python",
+    "./skills/typescript"
+  ]
+}
