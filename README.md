@@ -2,7 +2,7 @@
 
 A plugin whose skills teach a coding agent to install and use the APIMatic-generated **Spotify Web API SDK**, in C#/.NET, Python and TypeScript. Every SDK fact the skills state is grounded in the SDK's own source and generated documentation, not in what a model remembers about this API.
 
-This repo is a working copy for R&D on the plugin's delivery: subagent support and the fallback when a host has no subagents. The skills are the published `spotify` plugin 0.1.1 from [context-plugins/plugin-marketplace](https://github.com/context-plugins/plugin-marketplace/tree/main/plugins/spotify) at commit `d09ec8bd`, unchanged except `typescript-integrate-spotify-web-api`, which now hands planning to the agent below. The manifests and the agent are new.
+This repo is a working copy for R&D on the plugin's delivery: subagent support, and whether a fallback is needed when a host has no subagents. The skills are the published `spotify` plugin 0.1.1 from [context-plugins/plugin-marketplace](https://github.com/context-plugins/plugin-marketplace/tree/main/plugins/spotify) at commit `d09ec8bd`, unchanged except `typescript-integrate-spotify-web-api`, which now hands planning to the agent below. The manifests and the agent are new.
 
 ## What's inside
 
