@@ -13,5 +13,8 @@
     "./skills/dotnet",
     "./skills/python",
     "./skills/typescript"
+  ],
+  "agents": [
+    "./agents/typescript-spotify-web-api-sdk.md"
   ]
 }

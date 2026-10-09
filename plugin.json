@@ -13,5 +13,6 @@
     "./skills/dotnet",
     "./skills/python",
     "./skills/typescript"
-  ]
+  ],
+  "agents": "agents-vscode/"
 }
