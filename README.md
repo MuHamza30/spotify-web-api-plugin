@@ -51,7 +51,7 @@ If you also have the official `spotify` plugin installed, remove it first: both 
 
 ## Planning agent (TypeScript)
 
-`typescript-spotify-web-api-sdk` writes `spotify-web-api-plan.md`, the plan and contract sheet, before any project file changes. The TypeScript integrate skill spawns it first. It is a port of the .NET agent codegen-v2 generated before PR #250 (`SdkAgentRenderer`), cut down to planning and revising the plan. It sets no model, so each host runs it on its default subagent model.
+`typescript-spotify-web-api-sdk` writes `spotify-web-api-plan.md`, the plan and contract sheet, before any project file changes. The TypeScript integrate skill spawns it first. It is a port of the .NET agent codegen-v2 generated before PR #250 (`SdkAgentRenderer`), cut down to planning and revising the plan. The agent file names no model. Instead, the integrate skill asks the main agent to start it on a smaller model than its own, picked from the host's subagent tool, and to say which model it picked.
 
 | Host | File | How it loads |
 | --- | --- | --- |
