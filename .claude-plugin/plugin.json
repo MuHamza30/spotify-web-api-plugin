@@ -15,6 +15,6 @@
     "./skills/typescript"
   ],
   "agents": [
-    "./agents/typescript-spotify-web-api-sdk.md"
+    "./agents/typescript-spotify-web-api-planner.md"
   ]
 }
