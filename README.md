@@ -12,7 +12,7 @@ One skill set per language. The entry point is that language's integrate skill, 
 | --- | --- | --- |
 | C#/.NET | `dotnet-` | `dotnet-authentication`, `dotnet-calling-endpoints`, `dotnet-client-initialization`, `dotnet-configuration-resilience`, `dotnet-error-handling`, `dotnet-getting-started`, `dotnet-integrate-spotify-web-api`, `dotnet-models`, `dotnet-testing` |
 | Python | `python-` | `python-authentication`, `python-calling-endpoints`, `python-client-initialization`, `python-configuration-resilience`, `python-error-handling`, `python-getting-started`, `python-integrate-spotify-web-api`, `python-models`, `python-testing` |
-| TypeScript | `typescript-` | `typescript-authentication`, `typescript-calling-endpoints`, `typescript-client-initialization`, `typescript-configuration-resilience`, `typescript-error-handling`, `typescript-getting-started`, `typescript-integrate-spotify-web-api`, `typescript-models`, `typescript-testing` |
+| TypeScript | `typescript-` | `typescript-authentication`, `typescript-calling-endpoints`, `typescript-client-initialization`, `typescript-configuration-resilience`, `typescript-error-handling`, `typescript-getting-started`, `typescript-integrate-spotify-web-api`, `typescript-models`, `typescript-spotify-web-api-sdk-planner`, `typescript-testing` |
 
 The SDK itself is not on NuGet, PyPI or npm. Each getting-started skill installs it from its source repository: [spotify-csharp-sdk](https://github.com/context-plugins/spotify-csharp-sdk), [spotify-python-sdk](https://github.com/context-plugins/spotify-python-sdk) and [spotify-web-api-typescript-sdk](https://github.com/context-plugins/spotify-web-api-typescript-sdk).
 
@@ -60,7 +60,9 @@ If you also have the official `spotify` plugin installed, remove it first: both 
 | VS Code | `agents-vscode/typescript-spotify-web-api-sdk.agent.md` | root `plugin.json` `agents` |
 | Codex | `agents-codex/typescript-spotify-web-api-sdk.toml` | by hand: Codex plugins cannot bundle agents ([openai/codex#18988](https://github.com/openai/codex/issues/18988)). Copy the file to `~/.codex/agents/` and restart Codex |
 
-The three agent files share one body. Edit them together.
+The same instructions also ship as the skill `typescript-spotify-web-api-sdk-planner`, because some hosts can't install a plugin's agents (Codex). When the integrate skill can't start the agent, it tells the main agent to start a general subagent that loads this skill instead.
+
+The three agent files and the planner skill share one body. Edit them together.
 
 ## Usage
 
