@@ -1,6 +1,6 @@
 {
   "name": "spotify-web-api-plugin",
-  "description": "Marketplace hosting the spotify-web-api plugin: skills for integrating the APIMatic-generated Spotify Web API SDK.",
+  "description": "Marketplace hosting the spotify-web-api plugin: skills for integrating the APIMatic-generated Spotify Web API SDK, with a planner subagent.",
   "owner": {
     "name": "MuHamza30",
     "email": "muhammad.hamza@apimatic.io"
@@ -9,7 +9,7 @@
     {
       "name": "spotify-web-api",
       "source": "./",
-      "description": "Integrate and consume the APIMatic-generated Spotify Web API SDK — bundled skills for C#/.NET, Python and TypeScript."
+      "description": "Integrate and consume the APIMatic-generated Spotify Web API SDK — bundled skills for C#/.NET, Python, TypeScript."
     }
   ]
 }

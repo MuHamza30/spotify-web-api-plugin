@@ -1,19 +1,17 @@
 ---
 name: dotnet-configuration-resilience
-description: Client configuration and resilience for an APIMatic-generated .NET SDK in C# — retries and backoff, timeouts and cancellation, base-URL/server selection, list pagination, SSE streaming, and request/response logging. Load before you register or tune the client — the option names alone do not reveal which calls retry, what a timeout actually bounds, or what you must still set yourself.
+description: Load before registering or tuning an APIMatic .NET SDK client in C# — retries and backoff, timeouts and cancellation, base-URL/server selection, list pagination, SSE streaming, request/response logging and hooks. Load it even when the option names look obvious; they don't show which calls retry or what a timeout bounds.
 ---
 
 # Configuration & resilience for an APIMatic .NET SDK
 
-> **One skill, every shape.** This file covers every configuration surface the 4.0.0 generator
-> emits. Which parts YOUR SDK exercises — which pagination strategy an operation gets, whether any
-> operation declares an idempotency-key parameter, which server variables exist — are facts of the
-> API definition, not of this skill: take them from the contract sheet or the map, and **apply
-> only the guidance that matches**.
+> **One skill, every shape.** This file covers every configuration surface the SDK can have. Which
+> ones YOUR SDK uses — the pagination strategy of each operation, any idempotency-key parameters, the
+> server variables — is in the contract sheet or the map: **apply only the guidance that matches**.
 
-Most types below live under `{RootNamespace}.Core.Configuration` and `{RootNamespace}.Servers`; the SSE
-exceptions sit under `.Core.Exceptions` and the per-call `RequestOptions` under `.Core`. Each section names
-its own namespace. All of them are generic across APIMatic .NET SDKs built by this generator.
+Most types below live under `{RootNamespace}.Core.Configuration` and `{RootNamespace}.Servers`; the
+exception family (`SdkException` and its leaves — see **dotnet-error-handling**) sits under
+`.Core.Exceptions` and the per-call `RequestOptions` under `.Core`. Each section names its own namespace.
 
 ## ServerOptions configuration for each Environment
 
@@ -60,7 +58,7 @@ client to change environment.
 | Setting | Default |
 | --- | --- |
 | `StatusCodesToRetry` | `408, 429, 500, 502, 503, 504` |
-| `HttpMethodsToRetry` | `GET, HEAD, PUT, OPTIONS` (idempotent only — gates **every** retry trigger, see notes) |
+| `HttpMethodsToRetry` | `GET, HEAD, PUT, OPTIONS` — gates every retry trigger (Notes) |
 | `MaxRetries` | `3` |
 | `Delay` | `1s` |
 | `BackOffFactor` | `2` |
@@ -69,23 +67,12 @@ client to change environment.
 | `Timeout` | `100s` (**per attempt**) — **too long for any interactive path; set it explicitly** |
 | `OnRetry` | `null` |
 
-**Do the arithmetic on those defaults before you accept them.** `MaxRetries = 3` means up to 4 attempts, each
-bounded at `100s`, with `1s + 2s + 4s` of backoff between them. What that costs depends on the **verb**, because
-`HttpMethodsToRetry` gates *every* retry trigger — including the per-attempt timeout firing (see Notes):
-
-| Provider behaviour | On a retryable verb (`GET`/`HEAD`/`PUT`/`OPTIONS`) | On any other verb |
-| --- | --- | --- |
-| **Hangs** (no response at all) | up to **4 × 100s + 7s ≈ 407s** — the per-attempt timeout fires and the rejection **is** retried | ≤ **100s** — one attempt, then the call ends |
-| **Fails retryably** (a `503`, a connection reset) | up to **≈ 407s** — each attempt can burn nearly the full timeout | ≤ **100s** — one attempt at the provider's own latency; never resent |
-
-So the worst case on a `GET` is ≈**7 minutes** on the defaults — almost all of it per-attempt `Timeout`,
-not backoff — and up to ≈**9.7 minutes**
-(`4 × 100s + 3 × 60s`) against a provider that answers every attempt with a large `Retry-After`, since that
-header replaces the backoff and clamps at 60s (see Notes). Either way it is nowhere near the ≈100s the
-`Timeout` value suggests. The SDK's send path is fully async, so no thread is blocked — but the request, a
-pooled connection and the caller's browser are all held open for that whole window. Treat every default in
-this table as a value you have chosen only once you have written it down; `Timeout` in particular has no
-defensible default for a request-path call.
+**Worst case on the defaults:** up to 4 attempts × `100s` + `1s + 2s + 4s` of backoff ≈ **407s** on a
+retryable verb (`GET`/`HEAD`/`PUT`/`OPTIONS`) — whether the provider hangs (the per-attempt timeout is itself
+retried) or fails retryably — and up to ≈ **9.7 minutes** (`4 × 100s + 3 × 60s`) if every attempt returns a
+large `Retry-After`. Any other verb gets one attempt: ≤ **100s**. The request, a pooled connection and your
+caller are held open for that whole window, so choose every value in this table deliberately; `Timeout` has
+no safe default for a request-path call.
 
 Customize — always by `with` on `Default()`: every `RetryOptions` member is `required`, so a partial
 `new RetryOptions { MaxRetries = 5 }` does not compile:
@@ -106,75 +93,47 @@ Notes:
 - The *n*th retry waits `Delay * BackOffFactor^(n-1) + random(0, MaxJitter)` — so the 1st retry waits
   `Delay` (1s), the 2nd `Delay * BackOffFactor` (2s), and so on. Set `UseExponentialBackoff = false` for a
   constant `Delay` between attempts.
-- **`HttpMethodsToRetry` gates every trigger, not just the status one.** `ShouldHandle` reads
-  `method is in HttpMethodsToRetry && (transport fault || status is in StatusCodesToRetry)` — the method check
-  is a top-level `&&` sitting above *both* arms. So with the defaults a `POST`/`PATCH`/`DELETE` is **never**
-  resent by the SDK: not on a `503`, not on a connection reset, not on a timeout. This is the control that
-  keeps a non-idempotent write from executing twice, and it is on by default. Adding a verb to
-  `HttpMethodsToRetry` removes that protection for **every** operation that uses the verb, not just the one
-  you had in mind — read *Making a write safe under retries* below before you do.
-- **Three things trigger a retry on an eligible verb**, and one of them is easy to miss:
-  `HttpRequestException` (connection reset, DNS failure, dropped socket); `TimeoutRejectedException` — the
-  SDK's **own per-attempt `Timeout` firing**; and a response whose status is in `StatusCodesToRetry`. Because
-  the per-attempt timeout is itself a retry trigger, a hung provider on a `GET` costs the *whole* budget
-  (4 × `Timeout` + backoff), not one `Timeout`. A `TaskCanceledException` — from your own
-  `CancellationToken`, or from `HttpClient.Timeout` — is **not** in the set and ends the call where it fires.
-- **You never catch `TimeoutRejectedException`.** Once the retries are exhausted the SDK translates it, and
-  what reaches your `catch` is a `TaskCanceledException` — message *"The request was canceled due to the
-  configured RetryOptions.Timeout elapsing."* — whose `InnerException` is a `TimeoutException`. So the SDK's
-  own timeout and your own cancellation surface as the **same exception type**; tell them apart by the inner
-  exception, or by checking `ct.IsCancellationRequested`, not by the type you caught.
+- **`HttpMethodsToRetry` gates every trigger** — status, transport fault and timeout alike. With the
+  defaults a `POST`/`PATCH`/`DELETE` is **never** resent: not on a `503`, not on a connection reset, not on a
+  timeout — which keeps a non-idempotent write from executing twice. Adding a verb removes that protection for
+  **every** operation using it — read *Making a write safe under retries* below first.
+- **On an eligible verb three things trigger a retry:** an `HttpRequestException` (connection reset, DNS
+  failure, dropped socket), the SDK's **own per-attempt `Timeout` firing**, and a status in
+  `StatusCodesToRetry`. A `TaskCanceledException` — from your own `CancellationToken`, or from
+  `HttpClient.Timeout` — is **not** retried and ends the call where it fires.
+- **What reaches your `catch`:** an exhausted per-attempt `Timeout` as `SdkTimeoutException` (`Timeout` is
+  the window that elapsed), a connection reset, DNS failure or dropped socket as `SdkConnectionException`;
+  the raw exception is the `InnerException`, never what you catch. Your own cancellation surfaces unwrapped,
+  as `OperationCanceledException` / `TaskCanceledException`. See **dotnet-error-handling** for the family
+  and its messages.
 - **`Retry-After` overrides the computed backoff.** If the failing response carries a `Retry-After` header
   (delta-seconds or an HTTP date) that value is used as the delay instead of
   `Delay × BackOffFactor^n + jitter`. Both paths are then clamped to a hard **60s** ceiling that is not
   configurable — a provider asking for a 10-minute pause gets 60s, and a large `BackOffFactor` cannot push a
   single delay past a minute.
-- **Multipart is not blanket-excluded.** Retry eligibility is decided per request type *before* the
-  pipeline runs: a binary-body request with its payload **present** never retries (with the optional
-  payload absent it is an empty send and stays eligible); a multipart/form-data request retries
-  **unless it carries a binary part**; JSON, form-url-encoded and empty-body requests are eligible.
-  An ineligible request is **not** left unprotected — it runs on a *timeout-only* pipeline built
-  from the same `RetryOptions`, so it keeps the per-attempt `Timeout` and loses only the retry
-  strategy.
-- `Timeout` is **per attempt**, not total — to cap a whole call, use a `CancellationToken` (below). It is
-  nullable: set `Timeout = null` to disable the per-attempt timeout entirely.
+- **Some requests never retry:** one whose binary body is present, or a multipart form with a binary part.
+  They still get the per-attempt `Timeout`. JSON, form-url-encoded, other multipart and empty-body requests
+  follow the verb rule.
+- `Timeout` is nullable: `null` disables the per-attempt timeout. To cap a whole call, use a
+  `CancellationToken` (*Bounding a call* below).
 - `OnRetry`'s `RetryAttempt` also carries `Reason` — `RetryReason.Status(HttpStatusCode)` or
-  `RetryReason.Failure(Exception)` — log it to record *why* each retry fired.
-
-⚠▶▶ **A per-attempt timeout does not bound a REQUEST.** If one handler makes more than one SDK call —
-a loop over recipients or invoices, a fan-out, a send-then-schedule pair — the per-call timeouts **add up**, and
-they add up *faster* when each failure is caught so the work can continue: every swallowed timeout
-costs its full bound and the next call still runs. Two calls at 30s is a 60s request; three is 90s.
-Put one deadline on the whole handler and pass its token to every call inside it:
-
-```csharp
-using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-cts.CancelAfter(TimeSpan.FromSeconds(20));    // the REQUEST's budget, not one call's
-var deadline = cts.Token;
-// pass `deadline` — not `ct` — to every SDK call in this handler
-```
-
-**The check, and it is arithmetic, not judgement:** `calls in this handler × per-call timeout` must
-sit under the budget you are willing to make a caller wait. If it does not, the per-call timeout is
-not a bound on anything the caller can perceive. Count the calls in the loop, not the calls in the
-snippet — a handler that processes every record on file makes as many calls as there are
-records.
+  `RetryReason.Failure(Exception)` — log it to record *why* each retry fired. The per-attempt `Timeout`
+  firing arrives as `RetryReason.Failure(TimeoutRejectedException)` and a dropped connection as
+  `RetryReason.Failure(HttpRequestException)`, so switch on the exception type to tell them apart.
 
 ### Making a write safe under retries
 
-**Start from what the defaults already give you.** `HttpMethodsToRetry` gates every trigger (see Notes), so
-out of the box the SDK never resends a `POST`, `PATCH` or `DELETE` — on any trigger. Two gaps remain:
+**Start from what the defaults already give you:** the SDK never resends a `POST`, `PATCH` or `DELETE` (see
+Notes). Two gaps remain:
 
-- **`PUT` *is* in the default list.** HTTP calls `PUT` idempotent; your provider's `PUT` may still carry a
-  per-call side effect — an audit row, an outbound webhook, a metered charge — that a resend duplicates.
-- **"The SDK did not resend it" is not "the write did not happen."** A transport failure on a `POST` leaves
-  the outcome *unknown*: the bytes may have reached the provider before the socket died. That is a
-  reconciliation problem, and no retry setting solves it.
+- **`PUT` *is* in the default list.** Your provider's `PUT` may still carry a per-call side effect — an audit
+  row, an outbound webhook, a metered charge — that a resend duplicates.
+- **"The SDK did not resend it" is not "the write did not happen."** A transport failure on a write leaves
+  the outcome *unknown*: the bytes may have reached the provider before the socket died. No retry setting
+  solves that — see *A write whose outcome is unknown*.
 
-**Retries can be turned off.** `RetryOptions.Disabled()` is `Default() with { MaxRetries = 0 }`, and the
-factory skips the retry strategy outright when `MaxRetries <= 0` rather than handing `0` to Polly — so there
-is no `MaxRetryAttempts >= 1` validation error and no `MaxRetries = 1` floor. `Disabled()` keeps the
-per-attempt `Timeout`; only the retries go. The pipeline is built once in the client constructor, so this is a
+**Retries can be turned off per client.** `RetryOptions.Disabled()` is `Default() with { MaxRetries = 0 }`;
+it keeps the per-attempt `Timeout`. The pipeline is built in the client constructor, so this is a
 per-**client** choice, not a per-call one.
 
 **Decide which requirement you are meeting before you pick a remedy — they are not interchangeable:**
@@ -192,52 +151,25 @@ The four, **weakest guarantee first** — so do not read the numbering as a reco
 1. **Make the write idempotent at the provider** — a client-supplied unique reference or idempotency key,
    where the API offers one. Makes a resend *harmless* rather than rarer; the send count stays above one.
 
-   Look at the operation's **own parameters**, not just the request model. The generator can put a
-   provider's idempotency key in any of three places, and only one of them is the body:
+   Check **every member of the operation's `{Operation}Request` record**, not just its body model — ask the
+   contract sheet for the full record. The key can be a **header member** (a `string?` the method sends as
+   `new HeaderParam("...", request.X)`), a **form field** (a member passed to `new Param("...", request.X)`
+   in the form body — `required` on one operation and `string?` on the next, so match on the `Param`, not
+   on nullability), or a field of the **`Body` model**. Whether the provider actually rejects a duplicate
+   value is not visible in the SDK — such a field is typically just a nullable string; verify it against
+   live traffic before relying on it.
 
-   - a **header parameter** — a bare `string?` in the signature;
-   - a **form field** — routed into `FormUrlEncodedRequest.Create([...])`.
-     Do not search for a nullable type here: the same key can be declared **non-nullable** on one
-     operation and `string?` on the next. Match on the parameter reaching a
-     `new Param("...", x)` in the form body, not on its nullability;
-   - a field on the **request model**.
-
-   A model-only search finds nothing on the first two and concludes wrongly that the API offers no key. Ask
-   the contract sheet for the operation's full parameter list, not just its body shape.
-
-   Note that **whether the provider actually rejects a duplicate value is not visible in the model**. Such a
-   field is typically just a nullable string, equally consistent with a uniqueness-enforced key and with a
-   free-text label. Verify against live traffic before relying on it; if it is not enforced, this gives you
-   nothing.
-
-   ⚠ **An `Idempotency-Key` header on the wire is usually not the provider's key.** The generator puts
-   one on **every** non-GET operation and on no GET. Its value is almost always `Guid.NewGuid()`, injected
-   by the generator: not a spec parameter, no doc comment, nothing the caller can reach. The exception is
-   an operation whose own spec declares `Idempotency-Key` as a parameter, where the generator defers to
-   the caller's value.
-
-   So the header's *presence* tells you nothing — only the **source of its value** does, and that is visible
-   in the signature: if no parameter feeds it, it is injected. Three consequences, all of which cut against
-   the reading you would naturally take:
-
-   - **An injected key makes nothing safe unless your provider consumes that exact header name.** Most APIs
-     do not document `Idempotency-Key` as their mechanism, and on those it is inert.
-   - **The value is fresh per call.** `Guid.NewGuid()` is evaluated at the call site, before the resilience
-     pipeline runs — so it is stable across the SDK's *internal* retry attempts, and different on every
-     *caller-level* retry. The resend that a job re-running after a timeout produces is exactly the one it
-     cannot deduplicate.
-   - **It can sit alongside the real key, under a near-identical name.** One request can carry both the
-     injected `Idempotency-Key` *header* and a spec-declared `IdempotencyKey` *form field*; only the second
-     one means anything. Matching on the name alone picks the wrong one.
-
-   The trap is not that an injected key is useless; it is that it is *visible*. Seeing `Idempotency-Key` go
-   out on the wire, or in a log, reads as evidence that idempotency is handled. Treat it as absent until you
-   have confirmed both that the provider consumes that header name and that a parameter feeds it — and note
-   the default `HttpMethodsToRetry` includes `PUT`, so a `PUT` is resent by the SDK itself under a header
-   that probably means nothing to the provider.
+   ⚠ **Every non-GET call sends an `Idempotency-Key` header.** Unless the method fills it from the record
+   (`new HeaderParam("Idempotency-Key", request.X)`), its value is `Guid.NewGuid()`: stable across the SDK's
+   own retries, new on every call you make — so it cannot deduplicate a caller-level retry — and inert
+   unless the provider documents that header. It can sit beside a real `IdempotencyKey` form field under a
+   near-identical name; only the record member counts. Seeing the header on the wire or in a log is not
+   evidence that idempotency is handled: treat it as absent until the provider documents that header name
+   and a record member feeds it.
 2. **Reconcile after a failure** — on a transport failure on a write, re-read provider state to establish
    what actually happened instead of assuming nothing did. (Same reflex as an unreadable write response —
-   see `dotnet-error-handling`.) Detects a duplicate; does not prevent one.
+   see `dotnet-error-handling`.) Detects a duplicate; does not prevent one. How: see *A write whose outcome
+   is unknown* below.
 3. **A separate client for writes**, built with `Retry = RetryOptions.Disabled()`. Removes SDK-side resends
    entirely while keeping the per-attempt `Timeout`. Worth doing when you have widened `HttpMethodsToRetry`
    for the read path and need the write path held at one send regardless.
@@ -247,24 +179,19 @@ The four, **weakest guarantee first** — so do not read the numbering as a reco
    duplicate would be externally visible or costly to undo, and combine it with option 2 to settle the
    outcome of the one send you allowed.
 
-   Two details decide whether it works, and both are easy to get wrong:
+   Two details decide whether it works:
 
-   - **Do not keep the "already sent" marker on the `HttpRequestMessage`.** A fresh request object is built
-     for each attempt, so a marker set via `HttpRequestOptionsKey` is gone by the retry and the guard never
-     fires — measured: 4 sends, i.e. no protection at all. Keep the count in state that outlives the
-     request, such as an `AsyncLocal` scope the caller opens around the write; retries run inside the
-     caller's async context, so the scope flows into the handler on every attempt (measured: 1 send).
-   - **Do not throw an `HttpRequestException` to refuse**, and do not let the refusal path time out — both
-     are retry triggers, so the refusal itself becomes retryable. Throw a private sentinel type that derives
-     from `Exception`; it propagates out unwrapped, and your integration boundary translates it.
+   - **Keep the "already sent" count in state that outlives the request** — e.g. an `AsyncLocal` scope the
+     caller opens around the write; retries run inside the caller's async context, so the scope reaches the
+     handler on every attempt. Each attempt builds a fresh `HttpRequestMessage`, so a marker set via
+     `HttpRequestOptionsKey` is gone by the retry and the guard never fires.
+   - **Refuse by throwing a private type derived from `Exception`**, not `HttpRequestException`, and don't
+     let the refusal time out — both are retry triggers. The private type propagates unwrapped; your
+     integration boundary translates it.
 
    Count the send *before* it goes out. A request that failed on the way out may still have been received,
-   so "this may already have taken effect" is the only safe reading — surface it as an **unknown outcome**
-   to be settled by re-reading provider state (option 2), not as a definite failure.
-
-`HttpMethodsToRetry` **is** the primary control here — it gates every trigger, and keeping non-idempotent
-verbs out of it is most of the job. The options above cover what it cannot: a `PUT` with side effects, a list
-you have widened, and the unknown outcome a transport failure leaves behind.
+   so surface it as an **unknown outcome** settled by re-reading provider state (option 2), not as a
+   definite failure.
 
 **All four bound the call YOU make to the provider. None of them is a reason to change the contract
 your own callers see.** Taking an idempotency key from your callers can be a deliberate API design;
@@ -277,6 +204,51 @@ introduced, not a duplicate you prevented.
 path turns one transient failure into a permanent refusal: every later attempt meets the stale claim
 and is turned away. Clear it once the outcome is settled, and expire it when it never is.
 
+### ⚠⚠ A write whose outcome is unknown
+
+A transport failure on a write (`SdkConnectionException`, including `SdkTimeoutException`) means the write may
+still have landed. ⚠⚠ **A `catch` that reports a failure without first re-reading provider state is the
+defect.** Settle the outcome in code:
+
+1. **Re-read here**: look the write up by the reference you sent, or re-send it with the same idempotency key
+   where the operation declares one as a parameter (not the injected `Idempotency-Key` header).
+2. **Record and sweep**: set a local state that means *unknown*, not failed, and write the sweep that re-reads
+   the provider and settles those rows.
+
+With no reference to look up by, match on what the write carried (recipient, amount or content, within a time
+window). If the re-read finds nothing or fails too, the outcome is still unknown: record it for the sweep. If
+the provider offers no way to find the write at all, stop and raise that with the user. ⚠⚠ A log line is
+neither route.
+
+```csharp
+catch (SdkConnectionException)   // the write may still have landed
+{
+    var found = await client.{ApiGroup}.{LookupOperation}(new() { /* the reference you sent */ }, cancellationToken: ct);
+    // settle from what the provider holds for that reference
+}
+```
+
+### ⚠⚠ The same operation arriving twice
+
+Everything above stops one call being *sent* twice. It does not stop one operation being *requested*
+twice — a double-submit, a caller retry, a redelivered message, two instances racing. That needs a claim
+that outlives the request and the process, taken atomically:
+
+```csharp
+var reference = Deterministic(request);        // from what the request is for — never Guid.NewGuid()
+if (!await TryClaim(reference, ct))            // insert-or-fail: the store rejects the second claim, you catch it
+    return await LoadExisting(reference, ct);  // may still be in progress — do not report it done
+var result = await client.{ApiGroup}.{Operation}(/* `reference` as its idempotency key, if it has one */, cancellationToken: ct);
+await Complete(reference, result, ct);
+```
+
+Build `TryClaim` on whatever this codebase already uses to enforce uniqueness, and add no new store or
+dependency for it. If it has nothing that can hold such a claim, stop and raise that with the user.
+
+⚠⚠ An in-process lock (`SemaphoreSlim`, `AsyncLocal`, a static dictionary), a single-host assumption or an
+exists-then-insert read is no guard here: it lets both callers through — and documenting it as a known
+limitation does not change that.
+
 ## Bounding a call — the three layers, and which one is a total
 
 There are three places a bound can live, and **two of the three are per-attempt**: the two knobs named
@@ -288,22 +260,21 @@ There are three places a bound can live, and **two of the three are per-attempt*
 | `HttpClient.Timeout` | one attempt | `100s` | **No** — same; see below |
 | `CancellationToken` you pass to the call | the whole call | none | **Yes** — the only one |
 
-**`HttpClient.Timeout` is applied per attempt here, which is not obvious.** It is enforced by a CTS created
-inside each `SendAsync`, and the retry pipeline sits *above* `SendAsync` — so every retry gets a fresh full
-`Timeout`.
+Both per-attempt timeouts stop when the response headers arrive; reading the body after that is bounded
+only by your `CancellationToken` (on an event stream, also by `StreamReadTimeout`, below).
 
-**Two per-attempt timeouts, and on a retryable verb only one of them ends the call.**
-`options.Retry.Timeout` expiring raises `TimeoutRejectedException` *inside* the pipeline, which *is* in the retry set — on an eligible verb the
-attempt is retried and the cost multiplies (that is the ≈407s row above); only once the retries run out does
-the SDK convert it to the `TaskCanceledException` you catch. `HttpClient.Timeout` expiring raises
-`TaskCanceledException` directly, which is *not* in the set — so it ends the call the first time it fires,
-on any verb. (On a non-retryable verb the distinction collapses: neither is retried and both end the call on
-the first fire.) That asymmetry makes `HttpClient.Timeout` the cheapest hard bound on a hang: a `10s`
-value bounds a hang at ≈10s whatever the verb. What it does not bound is a provider that fails *retryably* just under the limit on every attempt — that still costs
-≈ `4 × 10s + 7s ≈ 47s`. It is also the only bound left standing if you set `options.Retry.Timeout = null`. A
-good backstop and the cheapest fix for a hang; still not a call budget.
+**`HttpClient.Timeout` also applies per attempt** — every retry gets a fresh full window.
 
-Set all three — they catch different failures. The per-attempt bounds cap a single stalled socket; the token
+**On a retryable verb only one of the two per-attempt timeouts ends the call.** `options.Retry.Timeout`
+firing is retried (the ≈407s case); `HttpClient.Timeout` firing is not — it ends the call the first time, on
+any verb — so a `10s` value bounds the wait for the response headers at ≈10s, though a provider failing
+*retryably* just under it on every attempt still costs ≈ `4 × 10s + 7s ≈ 47s`. Both surface as
+`SdkTimeoutException`, whose `Timeout` says which fired. With `options.Retry.Timeout = null` it is the only
+per-attempt bound left. An *infinite* `HttpClient.Timeout` never fires, and a `TaskCanceledException` under one
+passes through unwrapped. A good backstop and the cheapest fix for a hang before the headers; still not a call
+budget.
+
+Set all three — they catch different failures. The per-attempt bounds cap one attempt's wait for the headers; the token
 caps the sum, which is the only thing your caller experiences:
 
 ```csharp
@@ -313,7 +284,7 @@ options.Retry = RetryOptions.Default() with { Timeout = TimeSpan.FromSeconds(10)
 // httpClient.Timeout = TimeSpan.FromSeconds(10);   // per attempt, backstop — see dotnet-client-initialization
 
 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));  // the whole call — the mechanism;
-var response = await client.{ApiGroup}.{Operation}(/* ... */, ct: cts.Token);  // for WHERE it belongs, see below
+var response = await client.{ApiGroup}.{Operation}(request, cancellationToken: cts.Token);  // for WHERE it belongs, see below
 ```
 
 **Give the total bound one home, not one per call site.** A `CancellationTokenSource` written out at each
@@ -333,14 +304,34 @@ async Task<T> Bounded<T>(Func<CancellationToken, Task<T>> call, CancellationToke
 
 Then every operation goes through `Bounded(...)`, and the budget is one value in one place.
 
-**The invariant to check:** your worst case — `attempts × per-attempt timeout + total backoff` — must sit
-below the deadline your own caller is working to. If it does not, the caller times out first and your retries
-are burning provider capacity for a response nobody is still waiting for. A `TaskCanceledException` from your
-own token is **not** retried (see Notes above), so the token cuts the call cleanly.
+**The check:** `calls in the handler × (attempts × per-attempt timeout + backoff)` must sit below the
+deadline your own caller is working to — count loop iterations, not lines of code. A handler that makes
+several SDK calls (a loop over recipients or invoices, a fan-out, a send-then-schedule pair) adds up their
+bounds, and faster when each failure is caught so the work continues; pass one `Bounded` deadline token to
+every call in it. Cancelling that token is not retried, so it cuts the call cleanly.
+
+## The clock — `TimeProvider`
+
+Every place the SDK reads time goes through **one** option, `options.TimeProvider` (a
+`System.TimeProvider`, default `TimeProvider.System`): the retry backoff and the `Retry-After` arithmetic,
+the per-attempt `Timeout`, the SSE idle window (`StreamReadTimeout`, below), OAuth2 token expiry, webhook
+replay tolerance (its own `WebhookOptions.TimeProvider`) and the elapsed-milliseconds figure in the response
+log line.
+
+```csharp
+options.TimeProvider = TimeProvider.System;          // the default; set it only to substitute a clock
+```
+
+Under `services.Add{Api}Client(...)`, a `TimeProvider` registered in your container — in any order relative
+to the SDK registration — is used unless your `configure` callback sets one: explicit option > container
+registration > `TimeProvider.System`. The SDK **never registers** a `TimeProvider` itself. The same applies to
+`Add{Api}WebhookSignatureVerifier`.
+
+To fake it in tests, see **dotnet-testing** § *Fake the clock*.
 
 ## Pagination
 
-Operations the API marks as paginated return **`Pageable<{PageResponse}, {Item}>`**, and the shape catches
+Paginated operations return **`Pageable<{PageResponse}, {Item}>`**, and the shape catches
 people out: `Pageable<TPage, TItem>` implements `IAsyncEnumerable<`**`TItem`**`>`, so a plain `await foreach`
 walks **individual items**, not pages. The SDK fetches each page and advances the paging state for you —
 one of five strategies (offset, cursor, keyset, `Link`-header, or page-number), chosen per operation.
@@ -358,7 +349,7 @@ const int MaxPages = 100;
 int pages = 0;
 
 await foreach ({PageResponse} page in
-    client.{ApiGroup}.{Operation}(/* offset: 0, limit: 100, ... */, ct: ct).AsPages(ct))
+    client.{ApiGroup}.{Operation}(new {Operation}Request { /* Offset = 0, Limit = 100, ... */ }, cancellationToken: ct).AsPages(ct))
 {
     foreach (var item in page.{Items})
         Process(item);
@@ -373,13 +364,13 @@ total-count metadata on the page response lives** — the sample above uses it t
 equally when you need that metadata:
 
 ```csharp
-await foreach ({PageResponse} page in client.{ApiGroup}.{Operation}(/* ... */, ct: ct).AsPages(ct))
+await foreach ({PageResponse} page in client.{ApiGroup}.{Operation}(request, cancellationToken: ct).AsPages(ct))
 {
     // page carries its items plus whatever paging metadata the response declares
 }
 ```
 
-A failed page fetch throws `SdkException<TError>` mid-enumeration (see **dotnet-error-handling**).
+A failed page fetch throws `ApiException<TError>` mid-enumeration (see **dotnet-error-handling**).
 
 ### ⚠⚠ Never leave a page loop unbounded
 
@@ -388,18 +379,6 @@ enumeration terminates only when the provider stops handing out a next page. Tre
 me when to stop" as the *only* stop condition and you have written an unbounded loop: a provider that keeps
 returning a next-page link, a cursor that fails to advance, or a filter the provider quietly ignores will
 each spin until something else kills the request.
-
-What that failure looks like in production — the request does not return slowly, it **does not return at
-all**:
-
-```
-status=0  upstream=55909
-CLIENT_ERROR:TaskCanceledException:The request was canceled due to the configured
-HttpClient.Timeout of 75 seconds elapsing.
-```
-
-Tens of thousands of provider calls billed, the caller left holding a dead request, and no error the
-provider can be blamed for. The bug is entirely on the consuming side.
 
 **Every page loop needs at least one bound that does not depend on the provider's cooperation.** Pick the
 one that matches the use case; a page cap is the cheapest and is never wrong:
@@ -415,15 +394,26 @@ Prefer to **narrow the query before you page it**: a provider-side date range, s
 `pageSize` that matches what the caller needs turns "walk everything" into a handful of pages. Paging the
 whole collection and filtering client-side is the slow path even when it terminates.
 
-**A bound that silently truncates is a different defect from one that hangs.** When you hit the cap, either
-surface it to the caller or log it — never return a partial page set that reads like a complete one.
+**A bound that silently truncates is a different defect from one that hangs.** When you hit the cap the
+result is partial, and **that fact belongs in the result** — the caller never reads your logs, so a partial
+set that looks complete is a *wrong* answer. Return it in whatever form this codebase already uses to
+express a partial or continuable result:
 
-**No-throw variant.** Where generated, a sibling `{Operation}Result` returns
+```csharp
+// Shape, not a prescribed type — match the repository's existing result convention.
+return Partial(results, nextPage: page);   // the caller has to handle the partial case
+```
+
+If there is no such convention and the return type genuinely cannot change, throw rather than return
+silently. ⚠⚠ **A `LogWarning` at the cap followed by `return results;` is the defect.** Log it as well,
+never instead.
+
+**No-throw variant.** Where it exists, a sibling `{Operation}Result` returns
 `Pageable<ApiResult<{PageResponse}, TError>, {Item}>` — the same streaming, but its **`.AsPages(ct)`** hands
 you an `ApiResult` per page that you inspect instead of it throwing:
 
 ```csharp
-await foreach (var result in client.{ApiGroup}.{Operation}Result(/* ... */, ct: ct).AsPages(ct))
+await foreach (var result in client.{ApiGroup}.{Operation}Result(request, cancellationToken: ct).AsPages(ct))
 {
     if (result.TryGetResponse(out var pageResponse))   // the page (items + any cursor/link metadata)
     {
@@ -438,56 +428,51 @@ await foreach (var result in client.{ApiGroup}.{Operation}Result(/* ... */, ct: 
 
 > Not every list endpoint is paginated. An operation with no pagination metadata is a plain list call
 > (returns a list or a wrapper — see **dotnet-calling-endpoints**); to page one of those, drive its own
-> `page`/`perPage` query params yourself and stop when a page returns fewer than `perPage` items.
-> **A hand-driven loop needs the same bound as an auto-paginated one** — "fewer than `perPage`" and
-> "no next-page link" are both provider-supplied stop conditions, and neither is a bound. Carry a page
-> cap alongside it (see *Never leave a page loop unbounded* above).
+> `page`/`perPage` query params yourself, stop when a page returns fewer than `perPage` items, and carry
+> the same page cap (see *Never leave a page loop unbounded* above).
 
 ## Streaming (Server-Sent Events)
 
-Operations the API marks as streaming (`text/event-stream`) are generated to **return
-`Task<IAsyncEnumerable<{Item}>>`** — `await` the call once to open the stream, then `await foreach` the
+A streaming (`text/event-stream`) operation **returns `Task<IAsyncEnumerable<{Item}>>`** — `await` the
+call once to open the stream, then `await foreach` the
 frames as the server emits them. `{Item}` is `string` for a plain-text stream, or a typed model for a JSON
 event stream.
 
 ```csharp
-using {RootNamespace}.Core.Exceptions;   // SseException, SseTimeoutException, SseDeserializationException
+using {RootNamespace}.Core.Exceptions;   // SdkTimeoutException, ResponseDeserializationException, SdkConnectionException
 
 // await once to open the stream (an opening error surfaces here — see "Errors" below):
-IAsyncEnumerable<{Item}> stream = await client.{ApiGroup}.{Operation}(ct: ct);
+IAsyncEnumerable<{Item}> stream = await client.{ApiGroup}.{Operation}(cancellationToken: ct);
 
 try
 {
     await foreach (var frame in stream.WithCancellation(ct))   // each frame as the server emits it
         Process(frame);
 }
-catch (SseTimeoutException ex)              // no frame arrived within the idle-timeout window
+catch (SdkTimeoutException ex)                  // no frame arrived within StreamReadTimeout
 {
-    // ex.IdleTimeout — the window that elapsed
+    // ex.Timeout — the idle window that elapsed
 }
-catch (SseDeserializationException ex)      // a JSON frame didn't match {Item}
+catch (ResponseDeserializationException ex)     // a frame didn't match {Item} (JSON / parsed streams)
 {
-    // ex.RawFrame (offending payload) + ex.InnerException (the JsonException)
+    // ex.TargetType — {Item}; ex.InnerException — the JsonException / FormatException
+}
+catch (SdkConnectionException ex)               // the connection dropped mid-stream
+{
+    // ex.InnerException — the IOException / HttpRequestException
 }
 ```
 
-**Idle timeout.** A stalled stream is bounded by an **idle timeout** — the maximum wait **between frames** —
-which throws `SseTimeoutException` (rather than hanging) when it elapses. This is **not** a client-options
-property (there is no `StreamReadTimeout`); the idle window is a `TimeSpan?` carried on the SSE response
-itself, defaulting to **none** — a null window disables the check. When it does fire,
-`SseTimeoutException.IdleTimeout` reports the window that elapsed.
+**Idle timeout.** `StreamReadTimeout` on `{Api}ClientOptions` (a `TimeSpan?`, default **60 s**, `null` to
+wait indefinitely) bounds the wait **between frames**, never your own processing inside the loop. When it
+elapses the SDK tears the stream down and the enumeration throws `SdkTimeoutException` with `Timeout` set to
+the window — the same leaf as a per-attempt timeout, so one `catch (SdkTimeoutException)` covers both.
 
-**Errors** (all under `{RootNamespace}.Core.Exceptions`):
-- **Before the stream opens** — the opening `await` throws `SdkException<TError>`, with `TError` the same
-  two-case shape as any operation: a typed `{Operation}Error` (Case A) or `RawError` (Case B), per what the
-  operation declares (see **dotnet-error-handling**).
-- **While enumerating** — both of the following derive from a common `SseException` base (catch `SseException`
-  to handle either):
-  - `SseTimeoutException` — no frame arrived within the idle-timeout window; carries `IdleTimeout`.
-  - `SseDeserializationException` — a frame couldn't be deserialized to `{Item}` (JSON streams); carries the
-    `RawFrame` text and the underlying `JsonException` as `InnerException`.
-- Retries do **not** apply once the stream is open; cancel via the `CancellationToken`
-  (`stream.WithCancellation(ct)`) to stop early.
+**Errors:** the opening `await` throws `ApiException<TError>` — Case A or B, as for any operation (see
+**dotnet-error-handling**). While enumerating there is no SSE-specific type; the three leaves in the sample
+apply. The raw frame text is **not** on `ResponseDeserializationException` or in its message, and a
+plain-`string` stream cannot raise it. Retries do **not** apply once the stream is open; cancel with
+`stream.WithCancellation(ct)` to stop early.
 
 ## Logging
 
@@ -521,9 +506,8 @@ options.Logging = new LoggingOptions
 };
 ```
 
-What it emits, and at which level — every row is additionally gated by `_logger.IsEnabled(level)`, so a
-factory whose minimum level is `Warning` emits no request line at all; the SDK's switches are a *second*
-gate, not the only one:
+What it emits, and at which level — each row is also filtered by your `ILoggerFactory`'s minimum level, so a
+`Warning` minimum emits no request line at all:
 
 | Event | Level | On by default |
 | --- | --- | --- |
@@ -552,27 +536,22 @@ not. On any endpoint that carries card data, bank details, personal data or a cr
 switching this on writes that data to your logs. Leave it off in production; turn it on for one endpoint at
 a time behind a flag you can prove is off.
 
-⚠▶▶ **An environment variable turns all of this on without a code change.** When
-`options.Logging.LoggerFactory` is *still* `null` at construction — which in practice means a client you
-constructed yourself, since `Add{Api}Client` always fills it (it calls `AddHttpClient()`, which registers an
-`ILoggerFactory`) — the SDK reads
-`{APICLIENTTYPENAME}_LOG`, the client type name upper-cased plus `_LOG`. It accepts `info`, `debug` or
-`trace`, and writes to **stderr** through a built-in console logger. `debug` additionally forces request *and* response headers on; **`trace` additionally forces
-`LogRequestBody` on**, i.e. unredacted JSON bodies to stderr on a host you may not control. Assigning
-`LoggerFactory` yourself disables the variable outright — which is the reason to set it explicitly in
-production even when you point it at `NullLoggerFactory.Instance`.
+⚠ **An environment variable turns all of this on without a code change.** When
+`options.Logging.LoggerFactory` is *still* `null` at construction — in practice a client you constructed
+yourself, since `Add{Api}Client` always fills it — the SDK reads `{APICLIENTTYPENAME}_LOG`, the client type
+name upper-cased plus `_LOG`. It accepts `info`, `debug` or `trace`, and writes to **stderr** through a
+built-in console logger. `debug` also forces request *and* response headers on; **`trace` also forces
+`LogRequestBody` on** — unredacted JSON bodies to stderr on a host you may not control. Assigning
+`LoggerFactory` yourself — even `NullLoggerFactory.Instance` — disables the variable, so set it explicitly in
+production.
 
-**Per-call override.** Every generated operation takes a `RequestOptions? requestOptions = null` argument
-with two properties: `LogLevel?` — the logging override this section covers — and `Hooks`, the per-call
-hook list (see *Hooks* below). Passing `new RequestOptions { LogLevel = LogLevel.Debug }` **sets** the
-verbosity for that one call without touching the client's configuration — useful for tracing one failing
-endpoint. Two things about it are easy to get wrong:
-
-- It **replaces** the per-switch defaults in *both* directions, rather than only raising them. `Trace` turns
-  the body and headers on even when `LogRequestBody` is `false`; a value *above* `Information` — `Warning`,
-  say — switches the request line and the success response line **off** for that call.
-- It cannot lift a level your `ILoggerFactory` has filtered out. `_logger.IsEnabled(level)` is still ANDed in
-  front, so a per-call `Trace` against a factory whose minimum is `Information` logs nothing extra.
+**Per-call override.** `new RequestOptions { LogLevel = LogLevel.Debug }`, passed as the `requestOptions`
+argument every operation takes (see **dotnet-calling-endpoints**), **sets** the verbosity for that one call
+without touching the client's configuration. It replaces the per-switch defaults in *both* directions: `Trace`
+turns the body and headers on even when `LogRequestBody` is `false`, and a level above `Information` —
+`Warning`, say — turns the request line and the success response line **off** for that call. It cannot get
+past your `ILoggerFactory`'s minimum level: a per-call `Trace` against an `Information` minimum logs nothing
+extra.
 
 ### Hooks — the SDK's own request/response seam
 
@@ -598,11 +577,10 @@ The facts that decide how you use them:
   rate-limit budgets, a request-id echo) — the operation's return value carries only the body. A
   per-call hook can close over a local, which puts the observed value in scope in the same method's
   `catch`; a client-wide hook needs `AsyncLocal` or a scoped service to reach it.
-- **A hook is an observation seam, not a veto point.** An exception thrown from a hook is not retried
-  (the transport arm retries only `HttpRequestException` and the timeout rejection) — it just fails the
-  call, and a throwing `OnResponse` fails a call that succeeded on the wire. To refuse a re-send, use
-  the write-guard `DelegatingHandler` under *Make the write idempotent* — a blocked attempt must never
-  reach the network, which no observation hook can guarantee.
+- **A hook is an observation seam, not a veto point.** An exception thrown from a hook is not retried — it
+  fails the call, and a throwing `OnResponse` fails a call that succeeded on the wire. To refuse a re-send,
+  use the write-guard `DelegatingHandler` (option 4 under *Making a write safe under retries*): a blocked
+  attempt never reaches the network, which no hook can guarantee.
 
 ### When you still want a `DelegatingHandler`
 
@@ -631,52 +609,30 @@ var httpClient = new HttpClient(new LoggingHandler { InnerHandler = new HttpClie
 var client = new {Api}Client(httpClient, options);
 ```
 
-With DI, the SDK's `Add{Api}Client` resolves the **default (unnamed)** `IHttpClientFactory` client, so attach
-the handler to that one — register it and configure the default client *before* (or alongside) the SDK
-registration:
-
-```csharp
-services.AddTransient<LoggingHandler>();
-services.AddHttpClient(Options.DefaultName).AddHttpMessageHandler<LoggingHandler>();
-services.Add{Api}Client(options => { /* ... */ });   // resolves CreateClient() → the default client
-```
-
-The handler then runs on every SDK call — but so does everything else you configure on the default client,
-for **every other unnamed `CreateClient()` consumer in the app**. If that blast radius is unwelcome, skip the
-extension and register the client over a **named** `HttpClient` instead
-(`services.AddHttpClient("my-api").AddHttpMessageHandler<LoggingHandler>()`, then construct
-`new {Api}Client(factory.CreateClient("my-api"), options)`), which keeps the handler, timeout and primary
-handler scoped to this SDK. See **dotnet-client-initialization**.
-
-The `OnRetry` callback above is also a convenient place to observe retry activity.
+Under `Add{Api}Client`, attach it to the **default (unnamed)** `HttpClient` the extension resolves
+(`services.AddHttpClient(Options.DefaultName).AddHttpMessageHandler<LoggingHandler>()`, with the handler
+registered as transient) — which also affects every other unnamed consumer in the app — or register the
+client over a **named** `HttpClient`; see **dotnet-client-initialization**.
 
 ### Verify on the wire (first run of any new integration)
 
 **Run the built-in logger on the first execution of any new call and inspect the output** — the default
 `Information` request line is enough, so this costs one `LoggerFactory` assignment. Path/template params are
-not type-checked against the route (internally the value is
-`object?`; it is normalised *through* JSON — which is why an enum contributes its wire value and not its C#
-member name — then substituted as the resulting scalar's plain text, URL-escaped, by a plain string
-replace), and on a **successful** response the
-SDK returns only the deserialized body — it never surfaces the request URL or status (see
-**dotnet-error-handling**). So a wrong verb, a leftover `{placeholder}`, or a mis-serialized path segment
-**compiles cleanly** and produces no in-band signal; the only symptom is a runtime `404`/`422`.
+not type-checked against the route (an enum contributes its wire value, not its C# member name), and a
+**successful** call returns only the deserialized body — never the request URL or status. So a wrong verb, a
+leftover `{placeholder}`, or a mis-serialized path segment **compiles cleanly** and shows only as a runtime
+`404`/`422`.
 
 Checklist for the first printed request:
 1. the **verb** matches the operation (a `404` on a path you believe exists often means the wrong method);
-2. the **path** is fully formed. The failure to watch for is silent and unobvious: a path parameter whose
-   value is null or empty collapses to **nothing**, leaving a doubled slash (`/orders//authorize`) — not a
-   leftover marker. (An unbound `{placeholder}` would survive, but the generator supplies every declared
-   path param, so that is only reachable through a hand-set `BaseUrl`; and it prints percent-encoded,
-   `%7Bid%7D`, not as `{id}`.)
+2. the **path** is fully formed — a null or empty path parameter collapses to **nothing**, leaving a
+   doubled slash (`/orders//authorize`), not a leftover marker. Only a `{placeholder}` in a hand-set
+   `BaseUrl` survives, and it prints percent-encoded (`%7Bid%7D`);
 3. each **path-param segment** is the value the API expects — for an enum that is the **wire value**
-   (frequently ALL-CAPS), not the C# member name; the generated constants carry it. `FromValue("...")` is
-   the risk, but not in the way you would guess: a string that matches a declared constant
-   *case-insensitively* is normalised to the declared casing, so only a value matching **no** constant at
-   all reaches the URL verbatim — a typo, not a casing slip;
-4. the query params you set actually appear in the query string — remembering that a value is masked
-   unless its key is on the known-safe list (`cursor`, `dates`, `datetime`, `limit`, `offset`, `page`,
-   `since`, `size`, `strings`), so for anything else you are checking that the key is present, not what it
-   carries.
+   (frequently ALL-CAPS), not the C# member name; check `IsKnownValue()` before echoing a server-sent value
+   back (see **dotnet-models**);
+4. the query params you set actually appear in the query string — a value is masked unless its key is on
+   the known-safe list (see *Logging*), so for any other key you are checking that it is present, not what
+   it carries.
 
 Drop the level back once verified.

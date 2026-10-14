@@ -1,0 +1,31 @@
+from __future__ import annotations
+
+from typing_extensions import NotRequired, TypedDict
+
+from ..core import UNSET, Optional, SdkBaseModel
+from .cursor_object import CursorObject, CursorObjectDict
+
+
+class CursorPagingObject(SdkBaseModel):
+    href: Optional[str] = UNSET
+    """A link to the Web API endpoint returning the full result of the request."""
+
+    limit: Optional[int] = UNSET
+    """The maximum number of items in the response (as set in the query or by default)."""
+
+    next: Optional[str] = UNSET
+    """URL to the next page of items. ( ``null`` if none)"""
+
+    cursors: Optional[CursorObject] = UNSET
+    """The cursors used to find the next set of items."""
+
+    total: Optional[int] = UNSET
+    """The total number of items available to return."""
+
+
+class CursorPagingObjectDict(TypedDict):
+    href: NotRequired[str]
+    limit: NotRequired[int]
+    next: NotRequired[str]
+    cursors: NotRequired[CursorObjectDict]
+    total: NotRequired[int]

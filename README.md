@@ -1,73 +1,48 @@
 # Spotify Web API SDK Plugin
 
-A plugin whose skills teach a coding agent to install and use the APIMatic-generated **Spotify Web API SDK**, in C#/.NET, Python and TypeScript. Every SDK fact the skills state is grounded in the SDK's own source and generated documentation, not in what a model remembers about this API.
-
-This repo is a working copy for R&D on the plugin's delivery: subagent support, and whether a fallback is needed when a host has no subagents. The skills are the published `spotify` plugin 0.1.1 from [context-plugins/plugin-marketplace](https://github.com/context-plugins/plugin-marketplace/tree/main/plugins/spotify) at commit `d09ec8bd`, unchanged except `typescript-integrate-spotify-web-api`, which now hands planning to the agent below. The manifests and the agent are new.
+A plugin whose skills teach a coding agent to install and use the APIMatic-generated **Spotify Web API SDK**, in C#/.NET, Python, TypeScript. Every SDK fact the skills state is grounded in the SDK's own source and generated documentation, not in what a model remembers about this API.
 
 ## What's inside
 
-One skill set per language. The entry point is that language's integrate skill, which runs the plan-first workflow; the getting-started skill carries what is specific to this SDK, and the rest are API-agnostic and describe how to use any SDK the same generator produces.
+One skill set per language. The entry point is that language's getting-started skill, which carries what is specific to this SDK; the rest are API-agnostic and describe how to use any SDK the same generator produces.
 
 | Language | Skill prefix | Skills |
 | --- | --- | --- |
 | C#/.NET | `dotnet-` | `dotnet-authentication`, `dotnet-calling-endpoints`, `dotnet-client-initialization`, `dotnet-configuration-resilience`, `dotnet-error-handling`, `dotnet-getting-started`, `dotnet-integrate-spotify-web-api`, `dotnet-models`, `dotnet-testing` |
-| Python | `python-` | `python-authentication`, `python-calling-endpoints`, `python-client-initialization`, `python-configuration-resilience`, `python-error-handling`, `python-getting-started`, `python-integrate-spotify-web-api`, `python-models`, `python-testing` |
-| TypeScript | `typescript-` | `typescript-authentication`, `typescript-calling-endpoints`, `typescript-client-initialization`, `typescript-configuration-resilience`, `typescript-error-handling`, `typescript-getting-started`, `typescript-integrate-spotify-web-api`, `typescript-models`, `typescript-spotify-web-api-planner-brief`, `typescript-testing` |
+| Python | `python-` | `python-authentication`, `python-calling-endpoints`, `python-client-initialization`, `python-configuration-resilience`, `python-error-handling`, `python-event-streams`, `python-file-handling`, `python-getting-started`, `python-integrate-spotify-web-api`, `python-models`, `python-testing` |
+| TypeScript | `typescript-` | `typescript-authentication`, `typescript-calling-endpoints`, `typescript-client-initialization`, `typescript-configuration-resilience`, `typescript-error-handling`, `typescript-event-streams`, `typescript-getting-started`, `typescript-integrate-spotify-web-api`, `typescript-models`, `typescript-testing` |
 
-The SDK itself is not on NuGet, PyPI or npm. Each getting-started skill installs it from its source repository: [spotify-csharp-sdk](https://github.com/context-plugins/spotify-csharp-sdk), [spotify-python-sdk](https://github.com/context-plugins/spotify-python-sdk) and [spotify-web-api-typescript-sdk](https://github.com/context-plugins/spotify-web-api-typescript-sdk).
+## Agents
+
+| Agent | What it does |
+| --- | --- |
+| `spotify-web-api-planner` | Writes `spotify-web-api-plan.md`, the plan and its contract sheet, before any project file changes, and revises it in place. `dotnet-integrate-spotify-web-api`, `typescript-integrate-spotify-web-api` and `python-integrate-spotify-web-api` each start it first, on the main agent's own model. |
+
+How each host gets it:
+
+- **Claude Code** loads it from `agents/` with the plugin and lists it as `spotify-web-api:spotify-web-api-planner`. Its file sets `model: inherit`, so it runs on the main agent's model.
+- **Codex** plugins can't ship agents, so the same instructions ship as the skill `spotify-web-api-planner-brief`. The main agent starts a general-purpose subagent and has it load that skill.
+- **With no subagents at all** (turned off, or a host without them), the main agent says so in one line and writes the plan itself before any code.
 
 ## Install
 
-**Claude Code**
+This plugin was **generated for you, not published to a shared plugin marketplace** — so you install it from a local path rather than by name. Point your coding agent at the directory holding this plugin, then install it:
 
 ```
-/plugin marketplace add MuHamza30/spotify-web-api-plugin
-/plugin install spotify-web-api@spotify-web-api-plugin
+/plugin marketplace add <path to the directory containing this plugin>
+/plugin install spotify-web-api
 ```
 
-**Codex**
+In Codex the same two steps are CLI commands:
 
 ```
-codex plugin marketplace add https://github.com/MuHamza30/spotify-web-api-plugin
-codex plugin add spotify-web-api@spotify-web-api-plugin
+codex plugin marketplace add <path to the directory containing this plugin>
+codex plugin add spotify-web-api@<marketplace>
 ```
 
-**Cursor and VS Code**: clone the repo, then load the clone as a local plugin. Cursor reads `.cursor-plugin/`, and VS Code reads the root `plugin.json`.
+`<marketplace>` is the name the directory you just added registers under — `codex plugin marketplace list` prints it.
 
-```
-git clone https://github.com/MuHamza30/spotify-web-api-plugin.git
-```
+Once your team publishes it to a plugin marketplace, add that marketplace in place of the local path and install `spotify-web-api` from it by name.
 
-- Cursor: copy the clone (not a symlink) to `~/.cursor/plugins/local/spotify-web-api`, then run *Developer: Reload Window*.
-- VS Code: set `"chat.plugins.enabled": true` and `"chat.pluginLocations": { "<path to the clone>": true }`, then reload the window.
+Then ask a usage question (e.g. *"how do I authenticate this SDK with an API key?"*) to trigger the relevant skill.
 
-If you also have the official `spotify` plugin installed, remove it first: both carry skills with the same names.
-
-### Updating
-
-```
-/plugin marketplace update spotify-web-api-plugin
-```
-
-## Planning agent (TypeScript)
-
-`typescript-spotify-web-api-planner` writes `spotify-web-api-plan.md`, the plan and contract sheet, before any project file changes. The TypeScript integrate skill spawns it first. It is a port of the .NET agent codegen-v2 generated before PR #250 (`SdkAgentRenderer`), cut down to planning and revising the plan. The agent file names no model. Instead, the integrate skill asks the main agent to start it on the same model the main agent runs on, and to say which model it used.
-
-| Host | File | How it loads |
-| --- | --- | --- |
-| Claude Code | `agents/typescript-spotify-web-api-planner.md` | `.claude-plugin/plugin.json` `agents`; invoked as `spotify-web-api:typescript-spotify-web-api-planner` |
-| Cursor | `agents/typescript-spotify-web-api-planner.md` | `.cursor-plugin/plugin.json` `agents` |
-| VS Code | `agents-vscode/typescript-spotify-web-api-planner.agent.md` | root `plugin.json` `agents` |
-| Codex | `agents-codex/typescript-spotify-web-api-planner.toml` | by hand: Codex plugins cannot bundle agents ([openai/codex#18988](https://github.com/openai/codex/issues/18988)). Copy the file to `~/.codex/agents/` and restart Codex |
-
-The same instructions also ship as the skill `typescript-spotify-web-api-planner-brief`, because some hosts can't install a plugin's agents (Codex). When the integrate skill can't start the agent, it tells the main agent to start a general subagent that loads this skill instead.
-
-The three agent files and the planner skill share one body. Edit them together.
-
-## Usage
-
-Ask the agent to integrate the Spotify Web API into your project and the language's integrate skill loads, or ask a usage question (for example, *"how do I authenticate this SDK?"*). You can also invoke a skill by name, such as `/spotify-web-api:dotnet-getting-started`.
-
-## License
-
-MIT. See [LICENSE](LICENSE).

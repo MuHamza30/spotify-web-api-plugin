@@ -1,6 +1,6 @@
 ---
 name: dotnet-models
-description: Working with models in an APIMatic-generated .NET SDK in C# — building request models, required members and nullability, enums, union/AnyOf accessors, and JSON wire names versus C# property names. Load before constructing request payloads or mapping SDK models onto your own domain types.
+description: Load before building request payloads for an APIMatic .NET SDK in C# or mapping its models onto your own types — required members and nullability, OneOf/AnyOf unions, open enums, dates, collections, validation attributes, JSON wire names versus C# property names, and unknown fields.
 ---
 
 # Working with models in an APIMatic .NET SDK
@@ -18,18 +18,18 @@ installed package.
 When a field can be one of several types, APIMatic generates a union `record` (under
 `{RootNamespace}.Models.OneOf` or `.Models.AnyOf`). Build these with the generated **static factory
 methods** (one per variant) and read them back with **`TryGet…` methods** — a union has no
-object-initializer. JSON (de)serialization is automatic.
+object-initializer, and the `Optional<T>` backing each variant is internal, so the factories and
+`TryGet…` are the whole surface. JSON (de)serialization is automatic.
 
 - `OneOf` — the value is exactly one variant, selected on the wire by a **discriminator property** (e.g.
   `type`). The generated converter reads that property and switches on it.
 - `AnyOf` — no discriminator; the converter **tries each variant's schema in declaration order** and takes
   the first that deserializes.
 
-⚠ **A payload matching no variant throws.** Both converters end in
-`throw new JsonException("JSON does not match … schemas: …")`, raised mid-deserialization of the response —
-you do not get a null union or an unset variant. A provider that adds a variant your SDK predates turns
-into a `JsonException` on a call that was previously fine, so a union field is a place to expect
-regeneration pressure. See `dotnet-error-handling` for where that surfaces in a catch ladder.
+⚠ **A payload matching no variant throws** — you do not get a null union or an unset variant. In a response
+it reaches your catch as `ResponseDeserializationException` (see `dotnet-error-handling`), so a variant the
+provider adds that your SDK predates breaks a call that was previously fine — a union field is a place to
+expect regeneration pressure.
 
 ### Construct
 
@@ -43,12 +43,10 @@ var u2 = {Union}.{Variant}(new {Variant} { /* ... */ });
 {Union} u4 = new {Variant} { /* ... */ };    // same as {Union}.{Variant}(...)
 ```
 
-**A `OneOf`'s variants are always model or enum references** — the generator builds them from the schema's
-discriminator mappings, so a `OneOf` has no primitive, list or map variant at all, and every variant it does
-have gets an implicit conversion. An `AnyOf` is the open one: primitives and models get a conversion, while
-list, map and untyped-object variants do not, and neither do two variants that share one CLR type (the
-operators would collide). The factory is the form that always exists — reach for the implicit conversion
-only where you can see one.
+**A `OneOf`'s variants are always model or enum references** — it has no primitive, list or map variant, and
+every variant gets an implicit conversion. On an `AnyOf`, primitive and model variants get one; list, map and
+untyped-object variants do not, and neither do two variants that share one CLR type. The factory always
+exists — reach for the implicit conversion only where you can see one.
 
 ### Read / unwrap
 
@@ -77,15 +75,9 @@ CLR type name** — this is the single easiest thing to get wrong when writing a
 | a list of `{Variant}` | `.ListOf{Variant}(IReadOnlyList<{Variant}>)` | `TryGetListOf{Variant}(out IReadOnlyList<{Variant}>)` |
 | a map of `{Variant}` | `.MapOf{Variant}(...)` | `TryGetMapOf{Variant}(out …)` |
 
-So a `decimal` variant is `TryGetBigDecimal`, never `TryGetDecimal`; three variants that are all CLR
-`string` get three different names; and a `DateTimeOffset` variant is `TryGetDateTime` **or** `TryGetDate`
-depending on which the definition declared — two members, one CLR type, and the C# signature cannot tell
-them apart. Where two variants would collide outright the generator suffixes them (`String`, `String2`).
-The primitive rows apply to `AnyOf` only, since a `OneOf` has no primitive variants. **Take the exact member
-name from the contract sheet** (grounded from the SDK map/source) rather than deriving it from
-the C# type you see. (Unions use the per-variant factories and `TryGet…` readers shown above; `FromValue`
-belongs to enums.) The `Optional<T>` backing a union is internal — interact only through the factories and
-`TryGet…`.
+The primitive rows apply to `AnyOf` only. Two variants that would collide outright are suffixed (`String`,
+`String2`). **Take the exact member name from the contract sheet** (grounded from the SDK map/source) rather
+than deriving it from the C# type you see.
 
 ## Collections
 
@@ -103,23 +95,22 @@ var body = new {RequestType}
 
 A null collection is omitted from the JSON; an **empty** collection is serialized.
 
+**An untyped field holds a `JsonElement`.** A property typed `object` or `JsonElement` (nullable or not) holds a
+`JsonElement` after a read, when it is not `null`. Read it with the `JsonElement` API,
+never a cast to `Dictionary`.
+
 ## Dates & numbers
 
-- **A date/time field is not necessarily a `DateTimeOffset?` — check the property type.** The generator
-  emits `DateTimeOffset?` only where the API definition marks the field as a date/time. Where it does not,
-  the field is a plain `string?`, frequently carrying a `[RegularExpression]` attribute that *documents* an
-  RFC-3339 shape without enforcing it (see below). Both are common in the same SDK, and one of the sampled
-  SDKs has **no** `DateTimeOffset` in its models at all. Take the type from the contract sheet; a
-  `DateTimeOffset.Parse` written against a field that is already a `DateTimeOffset` will not compile, and a
-  hand-built string written into a `DateTimeOffset?` field will not either.
-- **A `DateTimeOffset` model property carries no converter** — it round-trips as `System.Text.Json`'s
-  default, ISO-8601 with an offset (`"2024-06-17T15:30:45+00:00"`), *even where the API documents a
-  date-only shape*. The generator does ship four date converters (ISO-8601, RFC-1123, Unix epoch seconds,
-  date-only), but it attaches them to **whole-response payloads** — an operation whose response body is a
-  date scalar, or a list or map of them — not to properties inside a model. So if a field's documented wire shape is `YYYY-MM-DD` and
-  the property is a `DateTimeOffset?`, what the SDK sends is the full ISO-8601 form, and reconciling that
-  with the provider is your problem, not the SDK's. Do not hand-format anyway; for your own formatting use
-  the BCL (`DateTimeOffset.Parse`, `.ToString("O")`), never the SDK's internal converters.
+- **A date/time field is not necessarily a `DateTimeOffset?` — check the property type.** It can be a
+  plain `string?`, often with a `[RegularExpression]` that *documents* an RFC-3339 shape without enforcing it
+  (see below); both occur in one SDK, and some SDKs have no `DateTimeOffset` at all. Take the type from the
+  contract sheet: `DateTimeOffset.Parse` against a field that is already a `DateTimeOffset` will not compile,
+  nor will a hand-built string written into a `DateTimeOffset?` field.
+- **A `DateTimeOffset` model property round-trips as `System.Text.Json`'s default**, ISO-8601 with an offset
+  (`"2024-06-17T15:30:45+00:00"`), *even where the API documents a date-only shape* — a field documented as
+  `YYYY-MM-DD` is sent in the full form, and reconciling that with the provider is yours. Do not
+  hand-format it; for your own formatting use the BCL (`DateTimeOffset.Parse`, `.ToString("O")`), never the
+  SDK's internal converters.
 - Money/quantities may be `string`, `decimal`, or a string-or-number `AnyOf` union; the model's property
   type is the source of truth. Numeric types vary per SDK (`int`, `long`, `double`, …) — take the exact
   type from the contract sheet; don't assume `double`.
@@ -155,12 +146,31 @@ an error path; it is usually not worth it on values your own code produced.
 
 ## Enums
 
-Enums are type-safe string-enums (`StringEnum<T>`) or int-enums (`IntEnum<T>`): use the static constants,
-or `FromValue(...)` for a value not known at compile time; they convert implicitly to their underlying
-value. Reading back: `.Value` (or the implicit conversion) yields the raw wire
-value — but **not** `ToString()`, see the warning below — and the enum types are `record`s, so `==`
-compares by value — `{EnumType}.FromValue("x")` equals the
-`x` constant. Guard unknown values with `TryGetKnownValue(...)` or `instance.IsKnownValue()`.
+Enums are type-safe records — `OpenStringEnum<T>` over `string` or `OpenIntEnum<T>` over `long` — never C#
+enums. Use the static constants; they convert implicitly to their underlying value. Reading back: `.Value`
+(or the implicit conversion) yields the raw wire value — but **not** `ToString()`, see the warning below —
+and `==` compares by value, so two instances read from the same wire value are equal.
+
+There is **no public factory**: `{EnumType}.FromValue(...)` does not exist, and an undeclared value cannot
+be constructed in code. Resolve a raw value with `{EnumType}.TryGetKnownValue(value, out var
+known)` — exact, case-sensitive — and guard a received value with `instance.IsKnownValue()`. A server value
+the SDK does not declare still deserializes (enums are open on reads), round-trips unchanged with the
+server's own casing, and compares without constructing one: `instance.Is("raw")` or `instance == "raw"`.
+
+Branch with the generated `Match`, not a `switch`: one `on{Member}` arm per declared value in declaration order,
+then `otherwise`, which receives the raw wire value of anything undeclared. Pass the arms by name — the
+parameters are positional, and a regenerated SDK that adds or reorders a value changes the signature (a
+source break, and `MissingMethodException` for an assembly compiled against the old shape).
+
+```csharp
+{request}.{EnumProp} = {EnumType}.SomeConstant;
+string wire = {response}.{EnumProp}.Value;                          // raw wire value back out
+if ({EnumType}.TryGetKnownValue(value, out var known)) { /* known constant */ }
+var text = {response}.{EnumProp}.Match(
+    onSomeConstant: () => "some",
+    onOtherConstant: () => "other",
+    otherwise: raw => $"undeclared: {raw}");
+```
 
 ⚠ **`ToString()` does not give you the wire value — it gives the record's debug form.** The base class
 overrides `ToString()` to return the value, but each generated enum is itself a `record`, so the compiler
@@ -179,40 +189,27 @@ on a **string** enum (the implicit conversion to `string` wins overload resoluti
 enum: there is no `string + int` operator, so it binds `string + object` and you get the debug form again.
 Use `.Value` explicitly whenever the string leaves your process, and the distinction stops mattering.
 
-**The known-value lookup is case-insensitive**, which is easy to rely on by accident. String enums build
-their constant table with `StringComparer.OrdinalIgnoreCase`, so `FromValue("captured")` returns the
-`CAPTURED` constant itself — same instance, `IsKnownValue()` true, and the **declared** casing is what goes
-on the wire. A casing slip in a configuration value is therefore silently corrected. What is *not*
-corrected is a value matching no constant at all: that is passed through verbatim, serialized verbatim, and
-`IsKnownValue()` returns false — so `IsKnownValue()` is the check that catches a typo, not a case mismatch.
-Int enums match exactly; only string enums are case-insensitive.
-
-⚠ **`FromValue` is emitted per enum, not guaranteed on all of them.** Some generated enums — server /
-environment selectors are the ones to watch — expose only their static constants and keep the conversion
-helper `protected`, so `{EnumType}.FromValue(someString)` does not compile. Check the type before you plan
-to map a configuration string through it; where it is absent, write the string→constant mapping yourself
-and default deliberately rather than reaching for a helper that isn't there.
-
-```csharp
-{request}.{EnumProp} = {EnumType}.SomeConstant;
-{request}.{EnumProp} = {EnumType}.FromValue(serverProvidedValue);   // tolerates unknown values
-string wire = {response}.{EnumProp}.Value;                          // raw wire value back out
-if ({EnumType}.TryGetKnownValue(value, out var known)) { /* known constant */ }
-```
+A member whose name would collide with the enum's own name, with the inherited or generated surface
+(such as `Value`, `Match` or `IsKnownValue`), or with a member of `object` carries a `Member` suffix — a
+value `value` becomes `ValueMember`; its siblings keep their plain names.
 
 See [reference.md](reference.md) for full string- and int-enum declarations and union-member discovery.
 
 ## Unknown / future fields
 
-Models declare their wire properties explicitly, and **every generated model also carries a
-`[JsonExtensionData]` property** — `public AdditionalProperties AdditionalProperties { get; init; } = [];`
-(`{RootNamespace}.Core.Models`) — so unknown JSON fields are **kept**, not dropped: a field the provider
-added after this SDK was generated survives deserialization and round-trips back out on serialize.
+Models declare their wire properties explicitly. An object or allOf model also carries a
+`[JsonExtensionData]` bag — `public AdditionalProperties AdditionalProperties { get; init; } = [];`
+(`{RootNamespace}.Core.Models`) — so unknown JSON fields are **kept**: a field this SDK does not model
+survives deserialization and round-trips back out on serialize. A model that admits no extra fields has no
+bag and drops them, a `OneOf`/`AnyOf` union has none of its own, and the bag is named `AdditionalProperties2`
+when the model already has an `AdditionalProperties` property. Take the bag's name and type from the contract
+sheet.
 
 Read one with `response.AdditionalProperties.TryGetValue<T>("field_name", out var value)` (deserializes
 the captured `JsonElement` to `T`), or `TryGetElement` for the raw `JsonElement`; `Set(key, value)` adds
-one to a request. Two cautions: the keys are **wire names** (there is no C# property, so nothing maps the
-casing for you), and a field appearing here rather than as a typed property is a regeneration signal —
-prefer regenerating the SDK over building program logic on stringly-typed lookups. The
-`AdditionalProperties` property itself has no `[JsonPropertyName]` and no wire name — its contents merge
-into the model's own JSON object.
+one to a request. When every extra field has one type, the bag is `AdditionalProperties<T>`, whose
+`TryGetValue("field_name", out var value)` takes no type argument. Two cautions: the keys are **wire names**
+(there is no C# property, so nothing maps the casing for you), and a field appearing here rather than as a
+typed property is one this SDK version does not type — prefer an SDK version that does over building
+program logic on stringly-typed lookups. The bag itself has no `[JsonPropertyName]` and no wire name — its
+contents merge into the model's own JSON object.

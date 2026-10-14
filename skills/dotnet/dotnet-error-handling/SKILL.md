@@ -1,6 +1,6 @@
 ---
 name: dotnet-error-handling
-description: Error and exception handling for an APIMatic-generated .NET SDK in C# — load before writing any try/catch around an SDK call, an exception-translation layer, or error middleware. Covers which exception types actually reach your catch blocks, how to read status codes and error bodies safely, and the traps that make an otherwise reasonable catch ladder silently wrong.
+description: Load before writing any try/catch around a call on an APIMatic .NET SDK in C#, an exception-translation layer or error middleware — which exception types reach your catch, the SdkException family, typed error bodies versus RawError, reading status codes and error bodies, and the non-throwing ApiResult variant.
 ---
 
 # Error handling for an APIMatic .NET SDK
@@ -8,70 +8,81 @@ description: Error and exception handling for an APIMatic-generated .NET SDK in 
 > Throughout this skill, `{...}` is a placeholder for a name you take from your SDK (e.g. `{Operation}`,
 > `{ApiGroup}`, `{RootNamespace}`) — replace it with the concrete identifier from the source.
 >
-> **One skill, every error shape.** This file covers every shape the 4.0.0 generator can emit.
-> Which shapes YOUR SDK uses — which case each operation is, whether typed bodies carry a status,
-> which `TryGet…` accessors exist — are facts of the API definition, not of this skill: take them
-> from the operation's map row or the contract sheet, and **apply only the guidance that
-> matches**. An API can be all Case B, nearly all Case A, or a mix.
+> **One skill, every error shape.** This file covers every error shape the SDK can have. Which ones
+> YOUR SDK uses — which case each operation is, whether typed bodies carry a status, which `TryGet…`
+> accessors exist — is on the operation's map row or the contract sheet: **apply only the guidance
+> that matches**. An API can be all Case B, nearly all Case A, or a mix.
 
 Endpoint methods **throw on non-success responses** by default (for a non-throwing alternative, see the
-**`ApiResult`** section below). The thrown type is always the generic `SdkException<TError>` — but `TError`
+**`ApiResult`** section below). The thrown type is always the generic `ApiException<TError>` — but `TError`
 comes in **two shapes**, depending on the operation:
 
 - **Typed model (Case A)** — a per-operation `{Operation}Error` (subclass of `ApiError`) exists under
   `Errors/` for the operation; `TError` is that type and you read it with typed `TryGet*` accessors.
 - **`RawError` (Case B)** — when the operation has no `{Operation}Error` type, `TError` is `RawError`
   *directly*. `RawError` is **not** an `ApiError` and has **no** `TryGet*` / `TryGetRawError` accessors; you
-  read the status and body straight off `ex.Error`. How common this is, is an API fact — some APIs are almost
-  entirely Case B, others almost entirely Case A; each operation's map row says which it is.
+  read the status and body straight off `ex.Error`.
 
-`SdkException<TError>` is declared `public sealed class SdkException<TError> : Exception` with **no**
-`where TError : ApiError` constraint — which is exactly why `TError` can be either an `ApiError` model or a
-`RawError`.
+### The `SdkException` family
 
-These types live in **distinct** namespaces — `Core.*` is **not** a single namespace, so don't assume
-`ApiError` sits with `SdkException` under `Core.Exceptions`:
+`ApiException<TError>` is one leaf of a small hierarchy. **Everything the SDK raises for a call derives from
+the abstract `SdkException`**, and every level adds the members its meaning needs:
 
-- `SdkException<T>` → `{RootNamespace}.Core.Exceptions`
-- `ApiError` **and** `RawError` → `{RootNamespace}.Core.ErrorResponse`
-- the per-operation `{Operation}Error` models (e.g. `CreateWidgetError`) → `{RootNamespace}.Errors`
+```
+SdkException (abstract)                 Method, RequestUri          — the call that failed; every Message starts with it
+├─ ApiException (abstract)              StatusCode, Headers, ContentType   — the server answered
+│  ├─ ApiException<TError> (sealed)     Error                       — an error status; TError is the operation's error type
+│  └─ ResponseDeserializationException  TargetType                  — a body (success OR error) did not match the declared type
+├─ SdkConnectionException               —                           — no usable response: could not send, or could not read the body
+│  └─ SdkTimeoutException (sealed)      Timeout                     — an attempt, the transport, or an SSE stream went silent
+└─ AuthSchemeException (sealed)         SchemeFailures              — a credential could not be applied
+```
 
-So a typed (Case A) catch needs up to **four** namespaces, not three — how many depends on whether you
-spell the `out` types out or use `out var`:
+Three rules follow from the shape, and the rest of this skill applies them:
 
-| namespace | what you need from it |
+- **Catch specific to general.** `ApiException` means *the server answered* (you have a status);
+  `SdkConnectionException` means *it did not*; `SdkException` is *everything the SDK raises*. A ladder that
+  handles only `ApiException<TError>` is incomplete — see *Connection failures* below.
+- **The raw cause is always `InnerException`** — the `JsonException`, the `HttpRequestException`, the
+  per-attempt timeout's rejection, the token endpoint's own failure — never the thing you catch.
+- **Your own cancellation is never wrapped.** An `OperationCanceledException` from a token *you* cancelled
+  passes through untouched; a `catch (SdkException)` does not see it.
+
+Every message names the call with its query stripped: `"GET https://host/path returned 400 (BadRequest)."`,
+`"{call} could not be sent: …"`,
+`"{call} could not read the response body: …"`, `"{call} received no response within 100 s."`,
+`"{call} returned a body that could not be deserialized into {Type}."`. A log line therefore identifies the
+failing call without a typed catch.
+
+`Core.*` is **not** one namespace — don't assume `ApiError` sits with the exceptions:
+
+| namespace | holds |
 | --- | --- |
-| `{RootNamespace}.Core.Exceptions` | `SdkException<TError>` — the exception itself |
-| `{RootNamespace}.Errors` | the `{Operation}Error` you name in the `catch` |
-| `{RootNamespace}.Core.ErrorResponse` | `RawError`, which the inherited `TryGetRawError` hands back |
-| *depends on the body* | the **typed body** a `TryGet…` yields — see below |
+| `{RootNamespace}.Core.Exceptions` | the whole `SdkException` family, `ApiException<TError>` included |
+| `{RootNamespace}.Core.ErrorResponse` | `ApiError` and `RawError` (which the inherited `TryGetRawError` hands back) |
+| `{RootNamespace}.Errors` | the per-operation `{Operation}Error` models (e.g. `CreateWidgetError`) |
 
-**The fourth is not a fixed namespace.** A typed body is whatever the API definition declared, so where
-its type lives follows the body's schema kind — a model in `{RootNamespace}.Models`, a union in
+A typed body's type lives wherever its schema kind puts it — a model in `{RootNamespace}.Models`, a union in
 `.Models.OneOf` / `.Models.AnyOf`, an enum in `.Models.Enums`, a binary body in `.Core.Models`
-(`ErrorByteContent`), and a map or dynamic body in no SDK namespace at all
-(`IReadOnlyDictionary<string, JsonElement>` needs `System.Collections.Generic` and `System.Text.Json`). A
-scalar body — `TryGetString`, `TryGetLong` — needs nothing. Read the accessor's `out` type and import what
-*it* names; do not assume `.Models`.
-
-The last two rows only bite when you write the `out` type out. `out var` needs neither, which is why the
-template below imports three namespaces and not four — it uses `out var` for the typed bodies and names
-`RawError` explicitly. A Case B catch needs only
-`Core.Exceptions` and `Core.ErrorResponse`. This namespace layout is identical across the APIMatic .NET SDKs
-checked.
+(`ErrorByteContent`), a map or dynamic body in the BCL (`IReadOnlyDictionary<string, JsonElement>` needs
+`System.Collections.Generic` and `System.Text.Json`); a scalar body (`TryGetString`, `TryGetLong`) needs
+nothing. Import what an `out` type you spell out names — `out var` needs none, which is why the template
+below imports three namespaces.
 
 ## Catch the exception
 
-`SdkException<TError>` exposes a single property — `public required TError Error { get; init; }`, the parsed
-error model. What `Error` *is* depends on the case (below).
+`ApiException<TError>` adds a single property of its own — `public required TError Error { get; init; }`,
+the parsed error model — on top of what it inherits: `StatusCode`, `Headers` and `ContentType` from
+`ApiException`, and `Method` and `RequestUri` from `SdkException`. So the HTTP status is **always** on the
+exception, in both cases; what `Error` *is* depends on the case (below).
 
-**Read the error directly off the strongly-typed `SdkException<TError>` — never use reflection.** The
+**Read the error directly off the strongly-typed `ApiException<TError>` — never use reflection.** The
 concrete `TError` is known right there at the `catch` (Case A: the typed `{Operation}Error`; Case B:
 `RawError`), so `ex.Error` and the accessors on it are reachable directly. Do **not** dig the body out via
 reflection (`ex.GetType().GetProperty("Error")`, then discovering and `Invoke`-ing the `TryGet*` methods):
 it compiles, but it is brittle glue that reinvents what a per-operation typed `catch` gives you for free —
 the concrete type is already known, so no runtime discovery is needed. Catch the concrete
-`SdkException<{Operation}Error>` (or `SdkException<RawError>`) and read `ex.Error` straight off it.
+`ApiException<{Operation}Error>` (or `ApiException<RawError>`) and read `ex.Error` straight off it.
 
 ### Which `TError` does an endpoint throw?
 
@@ -86,25 +97,26 @@ such line, but **not every generated operation has a doc block at all**, so its 
 about the error case; fall back to the contract sheet:
 
 ```csharp
-/// <exception cref="SdkException{TResult}"> of <see cref="RawError"/> when the server returns an error response.</exception>
+/// <exception cref="ApiException{TError}"> of <see cref="RawError"/> when the server returns an error response.</exception>
 ```
 
-`SdkException{TResult}` is boilerplate (identical on every method — `{TResult}` is the doc-comment's generic
+`ApiException{TError}` is boilerplate (identical on every method — `{TError}` is the doc-comment's generic
 placeholder, **not** the type you catch). The type named after **`of <see cref="…"/>`** is the actual
 `TError`:
 
-- `… of <see cref="{Operation}Error"/> …` → catch `SdkException<{Operation}Error>` (Case A).
-- `… of <see cref="RawError"/> …` → catch `SdkException<RawError>` (Case B).
+- `… of <see cref="{Operation}Error"/> …` → catch `ApiException<{Operation}Error>` (Case A).
+- `… of <see cref="RawError"/> …` → catch `ApiException<RawError>` (Case B).
 
-Equivalently, when grounding from the SDK source (the clone the getting-started skill describes): a
+Equivalently, when grounding from the SDK source (the SDK source the getting-started skill locates): a
 `{Operation}Error` type exists under `Errors/` **only** for Case-A operations; if there is no
-`{Operation}Error`, the operation throws `SdkException<RawError>`. Guessing wrong is only *sometimes* a compile-time error, and the direction that looks safe is the
-dangerous one. `SdkException<ListWidgetsError>` fails to compile when no such type exists — that guess the
+`{Operation}Error`, the operation throws `ApiException<RawError>`. Guessing wrong is only *sometimes* a compile-time error, and the direction that looks safe is the
+dangerous one. `ApiException<ListWidgetsError>` fails to compile when no such type exists — that guess the
 compiler does catch. But every `{Operation}Error` in the SDK *is* a real type, so naming the **wrong one**
 — a neighbouring operation's error type — compiles cleanly and then **never matches at runtime**, because
-`SdkException<A>` and `SdkException<B>` are unrelated closed generics. The exception sails past your
-`catch` and surfaces somewhere else, or not at all until it is an unhandled failure. Take the case from the
-contract sheet; the compiler is not a check on this.
+`ApiException<A>` and `ApiException<B>` are unrelated closed generics. The exception sails past your
+typed `catch` — and lands in a `catch (ApiException ex)` if you have one, where `ex.StatusCode` is still
+readable but the typed body is not. Take the case from the contract sheet; the compiler is not a check on
+this, and the non-generic base is a safety net, not a substitute.
 
 ### Case A — operation has a typed `{Operation}Error` model
 
@@ -122,21 +134,24 @@ memory:
    - the inherited **`TryGetRawError(out RawError)`**, which every `{Operation}Error` exposes.
 2. **Write one `if` / `else if` branch per `TryGet*` method — cover them all, and put `TryGetRawError`
    *last*.** Each public `TryGet*` corresponds to a status/body the operation can return; skip one and you
-   silently drop that response. `TryGetRawError` must be the final branch because it is **not** a catch-all
-   (see below) — it only fires for statuses that have no more-specific accessor.
+   silently drop that response. `TryGetRawError` must be the final branch because it is **not** a catch-all:
+   it only fires for a status with no more-specific accessor — a status with a typed or status-specific
+   `RawError` accessor (a `422` validation payload, `TryGetNoContent`) leaves it **false** — so checking it
+   first drops those bodies.
 
 ```csharp
-using {RootNamespace}.Core.Exceptions;     // SdkException<TError>
+using {RootNamespace}.Core.Exceptions;     // ApiException<TError>
 using {RootNamespace}.Core.ErrorResponse;  // ApiError, RawError
 using {RootNamespace}.Errors;              // {Operation}Error types, e.g. CreateWidgetError
 
 try
 {
-    var response = await client.{ApiGroup}.{Operation}(/* ... */, ct: ct);
+    var response = await client.{ApiGroup}.{Operation}(request, cancellationToken: ct);
     // use response
 }
-catch (SdkException<{Operation}Error> ex)
+catch (ApiException<{Operation}Error> ex)
 {
+    // ex.StatusCode / ex.Headers are always here; the body is behind the accessors below.
     // ONE branch per public TryGet* declared on {Operation}Error — copy the exact names from the class
     // under Errors/. The TryGet{...} names below are PLACEHOLDERS; yours are named after this operation's
     // responses (a typed body may be a model OR a scalar such as TryGetString/TryGetLong).
@@ -160,14 +175,6 @@ catch (SdkException<{Operation}Error> ex)
 }
 ```
 
-**Why `TryGetRawError` goes last — it is not a universal fallback.** It returns a raw body **only** for
-statuses that have no more-specific accessor on this `{Operation}Error`; a status that has a typed accessor
-(e.g. a `422` validation payload) lands in that typed slot and leaves `TryGetRawError` **false**. The
-status-specific `RawError` accessors (e.g. `TryGetNoContent(out RawError)`) are likewise **not** surfaced by
-`TryGetRawError`. So if you check `TryGetRawError` first — or omit any of the more-specific accessors — those
-typed and status-specific bodies are silently dropped. Enumerate the class and handle every accessor
-explicitly.
-
 **Don't factor error-reading into a shared helper typed as `ApiError`.** The typed `TryGet*` accessors live
 on the concrete `{Operation}Error`, *not* on the `ApiError` base — which exposes only `TryGetRawError`. A
 helper like `string Describe(ApiError e)` can therefore reach **only** `TryGetRawError`, so for any status
@@ -176,46 +183,47 @@ that has a typed body it finds nothing and falls back to `e.ToString()` — a ba
 per-operation `catch` block**, where the concrete `{Operation}Error` type is known; reserve shared code for
 the `RawError`/transport fallback only.
 
-### Case B — operation throws `SdkException<RawError>`
+### Case B — operation throws `ApiException<RawError>`
 
 For operations with no `{Operation}Error` type (none under `Errors/`), `ex.Error` **is** a `RawError` —
 there are no `TryGet*` accessors and no `TryGetRawError`; read the status and body straight off it:
 
 ```csharp
-using {RootNamespace}.Core.Exceptions;     // SdkException<TError>
+using {RootNamespace}.Core.Exceptions;     // ApiException<TError>
 using {RootNamespace}.Core.ErrorResponse;  // RawError
 
 try
 {
-    var response = await client.{ApiGroup}.{Operation}(/* ... */, ct: ct);
+    var response = await client.{ApiGroup}.{Operation}(request, cancellationToken: ct);
     // use response
 }
-catch (SdkException<RawError> ex)
+catch (ApiException<RawError> ex)
 {
     RawError raw = ex.Error;                          // the error model IS RawError here
-    Console.Error.WriteLine($"HTTP {(int)raw.StatusCode}");
+    Console.Error.WriteLine($"HTTP {(int)ex.StatusCode}");   // same value as raw.StatusCode
     Console.Error.WriteLine(raw.ReadAsString());      // or raw.ReadAsJson<MyDto>()
 }
 ```
 
-Case B needs no `.Errors` using — `RawError` lives under `{RootNamespace}.Core.ErrorResponse`. Its public
-members are `StatusCode`, `ReadAsBytes`/`ReadAsString`/`ReadAsJson<T>`; note
+Case B needs no `.Errors` using. `RawError`'s public members are `StatusCode`,
+`ReadAsBytes`/`ReadAsString`/`ReadAsJson<T>`; note
 `ReadAsJson<T>()` **throws `JsonException`** when the body isn't valid JSON — and a `RawError` body may not be
 (a gateway or proxy can answer with HTML or plain text), so prefer `ReadAsString()` unless you know it's JSON.
 
 ## Result-style alternative — `ApiResult<TResponse, TError>` (no throwing)
 
-The generator can **optionally** emit a result-style variant of an operation — so it's not guaranteed to
-exist. When enabled, it appears as a **sibling method** named `{Operation}Result` (next to the throwing
-`{Operation}`), returning `Task<ApiResult<TResponse, {TError}>>` and **does not throw** on a non-success
-status — the error is carried in the returned value instead. (`{TError}` is the same two-case shape as
-above: a typed `{Operation}Error`, or `RawError`.) `ApiResult<TResponse, TError>` is a public
-`readonly struct` under `{RootNamespace}.Core.Models`. If the controller has no `{Operation}Result`
-overload, this variant wasn't generated — use the throwing method with `try/catch` instead.
+An operation may have a **sibling method** named `{Operation}Result` (next to the throwing `{Operation}`),
+returning `Task<ApiResult<TResponse, {TError}>>`; it **does not throw** on a non-success status — the error
+is carried in the returned value instead. (`{TError}` is the same two-case shape as above: a typed
+`{Operation}Error`, or `RawError`.) `ApiResult<TResponse, TError>` is a public `readonly struct` under
+`{RootNamespace}.Core.Models`. If the controller has no `{Operation}Result`, use the throwing method with
+`try/catch`.
 
 Unlike the throwing path, `ApiResult` exposes the HTTP **`StatusCode`** and **`Headers`** on *both* success
-and failure — so this is the variant to use when you need the status code, rate-limit headers, or pagination
-`Link` headers.
+and failure — so this is the variant to use when you need a 2xx's status code, rate-limit headers, or
+pagination `Link` headers. The other way to read them on the success path is an `SdkHook.OnResponse` hook
+(see **dotnet-configuration-resilience** § Hooks); on the error path every `ApiException` already carries
+`StatusCode` and `Headers`.
 
 ```csharp
 using {RootNamespace}.Core.Models;        // ApiResult<TResponse, TError>
@@ -224,7 +232,7 @@ using {RootNamespace}.Errors;             // {Operation}Error (Case A only)
 
 // No try/catch — the *Result variant returns the outcome instead of throwing.
 ApiResult<{ReturnType}, {Operation}Error> result =
-    await client.{ApiGroup}.{Operation}Result(/* ... */, ct: ct);
+    await client.{ApiGroup}.{Operation}Result(request, cancellationToken: ct);
 
 if (result.TryGetResponse(out var response))        // success
 {
@@ -249,48 +257,69 @@ var summary = result.Match(onSuccess: r => "ok", onFailure: e => "failed");
 // Tuple deconstruction:
 var (isSuccess, response, error) = result;
 
-// Bridge back to the throwing behavior (returns the response or throws SdkException<{TError}>):
+// Bridge back to the throwing behavior (returns the response or throws ApiException<{TError}>):
 {ReturnType} value = result.GetResponseOrThrow();
 ```
 
 ## Connection failures, and guarding every call
 
-The exception types above cover API errors (the server replied with a non-2xx status). They do
-**not** cover connection failures — host unreachable, DNS failure, dropped connection, or timeout.
-Those come through as `HttpRequestException` / `TaskCanceledException`, which a
-`catch (SdkException<...>)` will not match. If that catch is your only guard, a connection failure
-escapes and takes down whatever was running the call.
+The `ApiException<TError>` catches above cover API errors only. No usable response — host unreachable, DNS
+failure, dropped connection, timeout — throws **`SdkConnectionException`** or its leaf **`SdkTimeoutException`**
+(`Timeout` says which window), with the raw cause in `InnerException`. A `catch (ApiException<...>)` does
+not match them; if it is your only guard, a connection failure escapes and takes down whatever was running
+the call.
+
+**A file download is the exception:** a drop while you read the returned `BinaryContent` throws a raw
+`IOException` from your read, not `SdkConnectionException`.
 
 **Convert connection failures to your own error type in one place.** If you wrap the SDK behind
 your own abstraction (a client interface, a service, a repository), catch connection failures at
 that boundary and rethrow the same error type you already use for API errors — so the rest of the
-code has a single failure type to handle instead of two unrelated ones:
+code has a single failure type to handle instead of two unrelated ones. Order the ladder as the
+hierarchy reads — leaves first, `SdkException` last:
 
 ```csharp
 // Keep the arms the operations you call actually need — each operation's map row names its case.
-catch (SdkException<{Operation}Error> ex)        // a Case A operation — typed error; may carry NO status
+catch (ApiException<{Operation}Error> ex)        // a Case A operation — typed error; ex.StatusCode is on it
 {
     // Carry the body's identity fields (the provider's own error code or name, any correlation
     // id) — the typed body is the only thing that carries them, and it does not outlive this
     // catch. Check the accessors in the SAME order as the Case A ladder above: every typed
     // accessor this operation declares (names from its map row), then the RawError-yielding
-    // arms LAST — those are the typed-path branches that DO carry a status.
+    // arms LAST. Carry ex.StatusCode alongside whichever branch fires.
     if (ex.Error.TryGet{Body}(out {Body} e))
-        throw new {ProviderException}(e.{MessageField} /* + identity fields — names from the model's map row */, ex);
+        throw new {ProviderException}(e.{MessageField} /* + identity fields — names from the model's map row */, ex.StatusCode, ex);
     if (ex.Error.TryGetRawError(out RawError raw))
-        throw new {ProviderException}($"HTTP {(int)raw.StatusCode}", raw.StatusCode, ex);
-    throw new {ProviderException}("unrecognised error shape", ex);
+        throw new {ProviderException}($"HTTP {(int)ex.StatusCode}", ex.StatusCode, ex);
+    throw new {ProviderException}("unrecognised error shape", ex.StatusCode, ex);
 }
-catch (SdkException<RawError> ex)                // a Case B operation — RawError carries the status
+catch (ApiException<RawError> ex)                // a Case B operation — no typed body, just the status
 {
     // Carry the status. The boundary ladder below is the only place it can be read back, and a
     // status dropped here cannot be recovered anywhere downstream.
-    throw new {ProviderException}("...", ex.Error.StatusCode, ex);
+    throw new {ProviderException}("...", ex.StatusCode, ex);
 }
-catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)  // connection failure
+catch (ResponseDeserializationException ex)      // the server answered, the body did not match — see below
 {
-    throw new {ProviderException}("provider unreachable", ex);   // no status — nothing answered
+    throw new {ProviderException}("The provider returned a response that could not be processed.", ex.StatusCode, ex);
 }
+// On a WRITE, the two catches below mean the outcome is unknown: the write may still have landed. Settle it
+// at the write's call site, where its reference is in scope — see "A write whose outcome is unknown" in
+// dotnet-configuration-resilience.
+catch (SdkTimeoutException ex)                   // an attempt, the transport, or a stream went silent
+{
+    throw new {ProviderException}($"provider did not answer within {ex.Timeout}", ex);   // no status
+}
+catch (SdkConnectionException ex)                // could not send / could not read the body (not a file you read later)
+{
+    throw new {ProviderException}("provider unreachable", ex);   // no status — nothing usable answered
+}
+catch (AuthSchemeException ex)                   // OUR credential could not be applied — see Notes
+{
+    throw new {ProviderException}("provider credentials rejected", ex);
+}
+// Do NOT add `catch (OperationCanceledException)`: the caller's own cancellation is not a provider
+// failure and the SDK never wraps it — let it propagate.
 ```
 
 **Guard every call site, not just the ones that change data.** It is easy to wrap the calls that
@@ -313,33 +342,19 @@ outcome and apply the identical catch ladder at every call site — same order, 
 When the same kind of failure (a validation rejection, say) becomes a different result on a
 different operation, callers can't reason about it. One shared ladder, not per-call improvisation.
 
-**Keep distinct failures distinct — and pick the discriminator from what the error path actually
-delivers.** Your error type needs to carry something that separates "you sent something invalid"
-from "the provider is down". The reflex is the HTTP status; whether you *can* carry one is an API
-fact, settled from the contract sheet before the boundary is written:
+**Keep distinct failures distinct.** Your error type needs to carry something that separates "you sent
+something invalid" from "the provider is down":
 
-- **Operations that throw `SdkException<RawError>`** (Case B) hand you `StatusCode` directly —
-  carry the status and key the ladder on it. A provider **4xx** the caller can act on surfaces as
-  that same client **4xx**; transport failures and unknowns surface as **5xx**.
-- **Operations with a typed `{Operation}Error`** (Case A) need checking before you assume a
-  status: `SdkException<TError>` itself has exactly one member, `Error`, with no `StatusCode` on
-  it, and on some APIs the typed bodies carry no status either. There the discriminator is the
-  body's own **identity fields** — the provider's error code or name, fine-grained issue
-  codes, a correlation id — which usually say more than a status would anyway (whether each field is `required` or nullable
-  is on the model's map row). And if the typed body itself declares a status field, that
-  body-carried status qualifies for the status-keyed ladder below — read it from the body and
-  key on it. A typed error
-  class can also route several documented statuses into ONE accessor (so "caller's fault or
-  provider's" may not be answerable from a status even in principle), while some operations add
-  status-specific `TryGet…(out RawError)` accessors — typed-path branches that DO carry one. The
-  operation's map row lists all of it.
-- **Accessor names differ per operation** — they embed the body type (`TryGet{Body}`), so a
-  guessed name is a compile error (`CS1061`), not a runtime surprise. Take each name from the
-  operation's own map row every time.
+- **Every `ApiException` carries `StatusCode`** — Case A, Case B and `ResponseDeserializationException`
+  alike — so a provider **4xx** the caller can act on can surface as that same **4xx**, and transport
+  failures and unknowns as **5xx**.
+- **A Case A body usually discriminates better** — its **identity fields**: the provider's error code or
+  name, fine-grained issue codes, a correlation id (whether each is `required` is on the model's map row).
+  One accessor can cover several documented statuses, so carry both the body fields and `ex.StatusCode`.
+  Accessor names embed the body type, so a guessed one fails to compile (`CS1061`) — take each from the
+  operation's map row.
 
-Whichever discriminator applies, collapsing every failure into one blanket status (e.g. 502 for
-everything) throws away the one signal that separates "you sent something invalid" from "the
-provider is down."
+Never collapse every failure into one blanket status (e.g. 502 for everything).
 
 One ladder, in the single place where your error type becomes a caller-facing status. This is where
 the discriminator you carried gets read back — a ladder with **no branch reading it** is
@@ -384,44 +399,24 @@ bucket; validation, conflict and not-found are the caller's to fix. And keep the
 5xx: a status or code you have not mapped is an unknown, not a caller error — the provider can add
 one without warning you.
 
-**If typed errors on your SDK carry no status and you genuinely need the transport status** — for
-metrics, or a provider-availability SLA — an `SdkHook.OnResponse` hook sees every response before
-the SDK maps it (`options.Hooks` client-wide, or `requestOptions.Hooks` per call — see
-**dotnet-configuration-resilience** § Hooks). Two caveats: hooks run once per attempt, so under
-retry "the status" means the last attempt's; and a client-wide hook needs an `AsyncLocal` or a
-scoped service to reach the catch site — a per-call hook can simply close over a local. Do not use
-it to drive ordinary error mapping — the body's identity fields are the better key and need none
-of that machinery.
+**A body that does not match the model is a third failure kind — catch it and sanitize.** The SDK
+throws **`ResponseDeserializationException`** — an `ApiException` (so `StatusCode`, `Headers` and
+`ContentType` are on it) that names the `TargetType` it was building, with the `JsonException` as
+`InnerException`. It is **not** an `ApiException<TError>`, so a ladder with only typed catches lets it
+through, and a generic handler that writes `exception.Message` leaks the SDK type name and the call URL.
+It fires on a success body, and on an error body that doesn't fit the operation's `{Operation}Error` —
+then your typed `catch` never fires, and there is no fallback to `RawError`. Catch it at the same boundary
+with a caller-safe message, and **read `ex.StatusCode` to tell the two cases apart**: an unreadable
+**success** body is genuinely unknown (5xx); an unreadable **error** body means the provider rejected the
+request and only the *detail* was lost — keep that status, or a retrying caller keeps retrying something
+that can never succeed:
 
-**An unreadable body is not one case but two — decide which before you map it.** An unreadable
-**success** body is genuinely unknown: 5xx. An unreadable **error** body is not — the provider
-rejected the request and only the *detail* was lost, so answering 5xx tells a retrying caller to
-keep retrying something that can never succeed. The trap below shows how the second case arises and
-what it costs you.
-
-**A success status with a broken body is a third failure kind — catch it and sanitize.** The
-server can return a 2xx whose body no longer matches the model, so the SDK throws
-`System.Text.Json.JsonException` while deserializing it. This matches **neither** a
-`catch (SdkException<...>)` (no error status was returned) **nor** a transport catch — so it
-escapes unhandled, and if it reaches a generic handler that writes `exception.Message` the
-response leaks `System.Text.Json.*` type and JSON-path detail. Catch it at the same boundary and
-convert it to your own error type with a caller-safe message:
-
-    catch (System.Text.Json.JsonException ex)
+    catch (ResponseDeserializationException ex)
     {
-        throw new {ProviderException}("The provider returned a response that could not be processed.", ex);
+        // 2xx  → the outcome is unknown: the call may have succeeded and we cannot read the result.
+        // else → the provider rejected the request; only the error DETAIL was lost. Keep the status.
+        throw new {ProviderException}("The provider returned a response that could not be processed.", ex.StatusCode, ex);
     }
-
-**The same exception also arrives from the *error* path, and means the opposite.** `{Operation}Error`
-models are generated per operation and can disagree with the body the API really sends on that
-status. When they do, the deserialization runs *while the error object is being constructed*, so the
-`JsonException` **replaces** the `SdkException` — your typed `catch` never fires, and the HTTP status
-is gone with it. Identical exception type, opposite meaning: the 2xx case is "outcome unknown", this
-case is "you were rejected and I lost the reason". A single `catch (JsonException)` that maps both to
-a 5xx is wrong half the time — see *Keep distinct failures distinct* above. Either treat that
-operation's parse failure as the rejection it is, or capture the status before the SDK discards it
-(an `SdkHook.OnResponse` hook sees it, at the cost of carrying HTTP state to your boundary out of
-band — and across a retry pipeline, of being ambiguous about *which* attempt you recorded).
 
 **Never map a parse failure onto a domain *absence*.** "I could not read the answer" is not "the
 provider said no." It is tempting on a lookup — an unreadable body and a genuine miss both leave you
@@ -430,21 +425,26 @@ gates a create, that conversion turns a corrupt response into a spurious create;
 produces a confident wrong answer, which is worse than an error. If the operation's miss really is
 signalled by an empty body, match on *empty*, not on *unparseable*.
 
-The rule generalizes: whatever converts SDK failures into your own type must carry only a
-caller-safe message — never surface `ex.ToString()` or `exception.Message` from an SDK or
-framework exception on the wire (the same leak the `ApiError.ToString()` bare-type-name trap
-above produces).
+Whatever converts SDK failures into your own type carries only a caller-safe message — never an SDK or
+framework exception's `ToString()` or `Message` on the wire.
+
+**A successful reply can still hand you `null`.** An omitted optional member reads `null`,
+and so does a JSON `null` on a required string, list, model or enum. An absent required member, or `null` on a
+number, `bool` or `Guid`, throws `ResponseDeserializationException`. Check the members you depend on after the
+call, and every object you reach them through (`x.Y` before `x.Y.Z`).
 
 ## Notes
 
-- On an SDK with **multiple/composite auth schemes**, a call can also throw `AuthSchemeException`
-  (under `{RootNamespace}.Core.Exceptions`) — an auth *application* failure, not an API error — when the
-  configured schemes can't be satisfied; it carries `IReadOnlyList<Exception> SchemeFailures` and is **not**
-  an `SdkException<T>`, so a `catch (SdkException<...>)` won't match it — catch it separately. (An SDK
-  whose API declares a single scheme never hits this.)
-- Retries happen automatically before an exception is thrown, and `HttpMethodsToRetry`
-  (`GET/HEAD/PUT/OPTIONS` by default) gates **every** trigger — status, transport fault, and the SDK's own
-  per-attempt timeout alike. So an error on a `POST`/`PATCH`/`DELETE` surfaces on the first attempt, with no
-  resend. That is not the same as "the write did not happen": a transport failure may have been thrown after
-  the bytes reached the provider, so the outcome is *unknown* and the caller needs to be told that rather
-  than "it failed". See **dotnet-configuration-resilience**.
+- A call can also throw `AuthSchemeException` (under `{RootNamespace}.Core.Exceptions`) — a credential
+  could not be *applied*, which is not an API error. It is an `SdkException` (so it names the API call you
+  made) but **not** an `ApiException`, so the typed catches above won't match it — give it its own arm, as
+  the ladder does. It carries `IReadOnlyList<Exception> SchemeFailures`: with a **single** failing scheme,
+  that failure is also the `InnerException` directly and the list's only entry; with **several** (an SDK
+  whose API composes schemes with OR and none succeeded), `InnerException` is an `AggregateException` of
+  them. The classic cause is an OAuth2 token endpoint refusing the client credentials: the token endpoint's
+  own `ApiException<RawError>` (pointing at the token URL, with its status) is the **cause** inside the
+  `AuthSchemeException`, not what your `catch` sees — so log `InnerException` to learn *why* auth failed.
+  An `AuthSchemeException` is never wrapped in another.
+- Retries run before anything is thrown; a call that sends a file is never retried, and with the defaults
+  neither is a `POST`/`PATCH`/`DELETE`. A transport failure on a write leaves its outcome *unknown* — tell the
+  caller that, not "it failed". See **dotnet-configuration-resilience**.

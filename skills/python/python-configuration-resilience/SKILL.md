@@ -1,6 +1,6 @@
 ---
 name: python-configuration-resilience
-description: Client configuration and resilience for an APIMatic-generated Python SDK — server and base-URL selection, the fact that the SDK performs NO retries and what that leaves you to build, what a timeout actually bounds, proxies and TLS, and request/response logging through the transport seam. Load before you configure or tune the client — the keyword names alone do not reveal what is handled for you and what is not.
+description: Load before configuring or tuning an APIMatic-generated Python SDK client — choosing the server or base URL, retries, idempotency keys, timeouts, proxies and TLS, or turning on request/response logging. Covers the default retry policy and what it repeats, what a timeout bounds, the built-in HTTP logging (off by default; `logging_options`, `{ROOT_PACKAGE}_LOG` and a per-call `log_level`), and what the SDK leaves to you.
 ---
 
 # Configuration & resilience for an APIMatic Python SDK
@@ -9,31 +9,26 @@ description: Client configuration and resilience for an APIMatic-generated Pytho
 > `{group}`, `{root_package}`) — replace it with the concrete identifier from the source.
 
 Configuration is not an options object here. Everything is either a **constructor keyword** on the
-client (`python-client-initialization`), a field on a **server config model**, or a **per-call
-`request_options`**. There is no third place to look.
+client (`python-client-initialization`), a field on a **config model** — the server config,
+`RetryOptions` or `LoggingOptions` — or a **per-call `request_options`**. There is no third place to look.
 
 ## What this SDK does not do for you
 
-Read this before designing around a capability you assume exists. The generator emits **none** of the
-following, so each is yours to build or deliberately do without:
-
-| Capability | Status | What to do instead |
-|---|---|---|
-| **Retries / backoff** | none — ruled out by design | Wrap your own call; see below |
-| **Streaming / SSE** | none — responses are fully buffered `bytes` | Not available through this SDK |
-| **Request/response logging** | none — no hook, no event | Wrap the transport; see below |
-| **Circuit breaking, rate limiting** | none | Your own, around the call |
-| **A mock/offline mode** | none | Point `base_url` at a mock server, or supply a fake transport (`python-testing`) |
+| Capability | What to do instead |
+|---|---|
+| **Circuit breaking, rate limiting** | Your own, around the call |
+| **A mock/offline mode** | Point `base_url` at a mock server, or supply a fake transport (`python-testing`) |
 
 What the SDK *does* own: the request pipeline, auth application and token caching, response decoding,
-error mapping, connection pooling, and one timeout.
+error mapping, connection pooling, one timeout, the retry loop (on by default — see *Retries* below),
+HTTP logging (silent until its logger is raised — see *Logging* below), and streamed file and
+event-stream responses (`python-file-handling`, `python-event-streams`).
 
 ## Server and base-URL configuration
 
-Server selection is **not** an environment enum. What the constructor accepts depends on what the
-description declares, in one of four shapes — take yours from the contract sheet, grounded in the SDK
-map's *Servers & auth* section, which names the environments and servers this SDK declares and so
-settles which arm it is:
+Server selection is **not** an environment enum. The constructor takes one of four shapes, set by what
+the API declares — take yours from the contract sheet; the SDK map's *Servers & auth* section settles
+which arm it is:
 
 | The API declares | Constructor keywords |
 |---|---|
@@ -52,18 +47,15 @@ client = {Api}Client(environment="production", server_config={"{server}": {"prod
 wrong nesting raises `ValidationError` rather than being ignored.** With one environment each server's
 field holds `base_url` directly. With several, each server's field holds **one field per environment**
 and the `base_url` sits inside the environment's variant — passing `{"{server}": {"base_url": ...}}`
-there fails with `Extra inputs are not permitted`. Take the nesting from the SDK map's *Servers & auth*
-section rather than from this shape.
+there fails with `Extra inputs are not permitted`.
 
-Either way `server_config` is a pydantic model with a dict companion, coerced through `.coerce()`,
-holding **one field per server the API declares**. Template variables sit beside `base_url` at
+Either way `server_config` is a pydantic model with a dict companion, holding **one field per server
+the API declares**. Template variables sit beside `base_url` at
 whichever level carries it.
 
-**Omitting the server keyword takes the description's own default, and that default is whatever the
-spec listed first — for many providers a sandbox.** Nothing announces it. A deployment that believes it
-configured production and did not gets sandbox behaviour with production credentials, which fails auth
-in a way that looks like a credentials problem, not an environment one. Pass the server explicitly in
-every environment, production included.
+**Omitting the server keyword silently selects the API's first-listed environment — often a
+sandbox.** Production credentials against it fail like a credentials problem, not an environment one.
+Pass the server explicitly in every environment, production included.
 
 **Server template variables are only reachable in the `server_config` arms.** They are fields on the
 config class, so where the constructor takes a `server_config` you set them there. Where it takes a
@@ -83,123 +75,167 @@ Where the SDK manages OAuth, **the token endpoint is derived from the same serve
 auth can never drift apart. Pointing `base_url` at a mock server or recording proxy therefore redirects
 the token fetch too.
 
-## Retries — there are none
+## Retries — on by default
 
-**This is the headline fact, and it is the opposite of what most SDK generators do.** There is no retry
-policy, no backoff, no pipeline to configure. An architectural decision record rules retries out of the
-request path deliberately. Concretely:
-
-- A `429` or `503` raises on the first attempt. Nothing is resent.
-- A connection reset raises. Nothing is resent.
-- Even the one place that looks automatic — a `401` — is not a retry. The cached credential is
-  invalidated so the *next* call re-authenticates; the failing request is not resent. You see one
-  `401`, then recovery.
-
-Two implications, and the second is easy to give away by accident:
-
-1. **Whatever retrying your integration needs, you write**, outside the SDK call. There is no knob.
-2. **You inherit no accidental duplicate writes.** A failed write was attempted exactly once at the SDK
-   layer. That is a genuinely valuable property — do not discard it carelessly when you add retries.
-
-### Adding retries yourself
-
-Use `tenacity`, `backoff`, or a plain loop; wrap **your** call, and decide per operation:
+A client built without `retry_options` uses the **default policy** in the table below. Retrying is
+configured by one options class, `RetryOptions` (from `{root_package}.core`), passed to the
+client in any of four spellings:
 
 ```python
-import httpx
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential_jitter
-from {root_package}.core import ApiError
+from {root_package}.core import HttpMethod, RetryOptions
 
-def _is_transient(e: BaseException) -> bool:
-    if isinstance(e, httpx.TimeoutException | httpx.ConnectError):
-        return True
-    return isinstance(e, ApiError) and e.status_code in {429, 500, 502, 503, 504}
-
-@retry(
-    retry=retry_if_exception(_is_transient),
-    stop=stop_after_attempt(3),
-    wait=wait_exponential_jitter(initial=1, max=10),
-    reraise=True,
-)
-def fetch(resource_id: str):
-    return client.{group}.{operation}(resource_id)      # a read: safe to retry
+client = {Api}Client(retry_options=3, {scheme}=...)                  # a count: max_retries=3, every other field at its default
+client = {Api}Client(retry_options={}, {scheme}=...)                 # every field at its default, as omitting it does
+client = {Api}Client(retry_options={"max_retries": 5}, {scheme}=...)  # a dict: the fields you name, the rest at their defaults
+methods: frozenset[HttpMethod] = frozenset({"GET"})                  # held in a variable: annotate it
+client = {Api}Client(
+    retry_options=RetryOptions(max_retries=5, http_methods_to_retry=methods),
+    {scheme}=...,
+)                                                                    # the model itself
 ```
 
-Rules to hold to:
+**Turning retries off** is `max_retries` set to `0`, in whichever spelling: `retry_options=0`,
+`{"max_retries": 0}` or `RetryOptions(max_retries=0)`. Leaving `retry_options` out, or passing `None`,
+`{}` or `RetryOptions()`, all give the **default policy** — none of them turns retrying off.
 
-- **Retry idempotent reads freely; treat every write as a separate decision.** A write that timed out
-  may have succeeded — a reset after the bytes reached the server is indistinguishable from one before.
-- **Never retry a `ValidationError`, or a 4xx other than `429`.** They cannot succeed on a second try.
-  A decode failure in particular is not transient (`python-error-handling`).
-- **Respect `Retry-After`** when present: `e.response.headers.get("retry-after")` — header keys are
-  lowercased, so look it up that way.
-- **Cap the worst case.** `attempts × timeout + backoff` must sit below whatever deadline your own
-  caller works to, or you are burning provider capacity for a response nobody is waiting for.
+`RetryOptions` is a frozen pydantic model and its dict companion is a closed `TypedDict`, so a misspelt
+key or an out-of-range value (a negative count, a `backoff_factor` below `1`) raises `ValidationError`
+at construction rather than being ignored.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `max_retries` | `3` | Retries *after* the first attempt; `0` disables |
+| `initial_delay` | `1.0` | Seconds before the first retry |
+| `backoff_factor` | `2.0` | Multiplier per retry; `1` keeps the delay constant |
+| `max_delay` | `60.0` | Ceiling on any one wait, a `Retry-After` included |
+| `max_jitter` | `0.5` | Widest random addition to a wait, in seconds; `0` removes it |
+| `status_codes_to_retry` | `frozenset({408, 429, 500, 502, 503, 504})` | Statuses that qualify |
+| `http_methods_to_retry` | `frozenset({"GET", "HEAD", "PUT", "OPTIONS"})` | Methods that may be repeated at all |
+
+The wait before retry *n* (from 0) is `min(initial_delay × backoff_factor ** n + jitter, max_delay)`,
+or the server's `Retry-After` — seconds or an HTTP date — capped at `max_delay` when it sends one.
+
+A call is repeated only when **all** of these hold:
+
+- its method is in `http_methods_to_retry` — this gates dropped connections and timeouts as well as
+  statuses, so the default never repeats a `POST`, `PATCH` or `DELETE`;
+- it failed with a status in `status_codes_to_retry`, or with no response at all;
+- its body can be sent again — `bytes`, a `Path`, JSON, form and text bodies can; a binary body or a
+  multipart file read from an open stream cannot;
+- retries remain.
+
+A `401` is never in the default set; it invalidates the cached credential for the next call instead
+(`python-authentication`). Whatever you add to `status_codes_to_retry` is retried, so leave out
+statuses that cannot succeed a second time. When the last attempt fails, you see what a single attempt
+would give you: the `ApiError`, the raw response's `Failure`, or the HTTP library's own exception.
+
+A **custom transport** must raise `TransportError` (`from {root_package}.core import TransportError`)
+for a failed send to be retried; the shipped `Httpx2Client` does. Anything else it raises reaches you on
+the first attempt.
+
+### Per-call overrides
+
+`request_options` overrides two fields for one call; the rest stay the client's:
+
+```python
+client.{group}.{operation}(arg, request_options={"max_retries": 0})                     # this call: no retries
+client.{group}.{operation}(arg, request_options={"status_codes_to_retry": frozenset({429, 503})})  # this call: a narrower set
+```
+
+**Do not wrap the call in a second retry layer** (`tenacity`, a loop of your own): attempts multiply,
+and each of your attempts is a new call with a new idempotency key (below). If you need behaviour the
+options cannot express, turn the SDK's off for that call and own it.
 
 ### Making a write safe when you retry
 
-Some write operations declare an **idempotency-key parameter** — a header the provider uses to collapse
-a duplicate submission. Whether a given operation has one is per-operation and visible only in its
-signature, so **check before you assume**; in practice a description declares them on some writes and
-not others.
+**Every operation other than a `GET` sends an `Idempotency-Key` header** — a UUID minted once per call,
+unless the operation has its own `Idempotency-Key` header parameter, which is then a keyword you set.
+Within the SDK's retry loop every attempt carries the *same* key, which is what makes adding `POST`
+to `http_methods_to_retry` safe **where the provider deduplicates on it**. A retry you write yourself is
+a new call and mints a new key — the provider sees two submissions.
 
-Where one exists, generate the key **once per logical action** and reuse it across every attempt:
+Where the operation declares the parameter itself, derive the key from what the request is for, and
+reuse it on every attempt and every repeat:
 
 ```python
-request_id = str(uuid.uuid4())                       # once per logical action, not per attempt
+request_id = derive_ref(request)                     # the same on every attempt and every repeat — never uuid4()
 client.{group}.{operation}(body, {idempotency_key}=request_id)
 ```
 
 Two things the signature will not tell you, both of which need the provider's own documentation:
 
-- **Whether the provider actually enforces it.** The parameter existing is not a guarantee that a
+- **Whether the provider actually enforces it.** The header being sent is not a guarantee that a
   resend is deduplicated.
 - **The retention window.** Keys expire, and windows differ per API — so a resend after a long backoff
   may no longer be collapsed.
 
-**Where an operation has no idempotency parameter, retrying it is a real duplication risk.** The safe
-recovery is to re-read state and decide, not to resend. Some such operations are naturally idempotent
-(cancelling an already-cancelled resource is usually harmless), but that is a per-operation judgement —
-make it deliberately rather than retrying the whole class.
+**Where the provider ignores the key, retrying a write is a real duplication risk.** Keep `POST` out
+of the gate; the safe recovery is to re-read state and decide, not to resend. Some such operations are
+naturally idempotent (cancelling an already-cancelled resource is usually harmless), but that is a
+per-operation judgement — make it deliberately rather than retrying the whole class.
+
+### ⚠⚠ The same operation arriving twice
+
+Everything above stops one call being *sent* twice. It does not stop one operation being *requested*
+twice — a double-submit, a caller retry, a redelivered message, two workers racing. The SDK's own
+`Idempotency-Key` does not help here: it is new on every call. Stopping it needs a claim that outlives
+the request and the process, taken atomically:
+
+```python
+ref = derive_ref(request)                  # from what the request is for — never uuid4()
+if not try_claim(ref):                     # insert-or-fail: the store rejects the second claim, you catch it
+    return load_existing(ref)              # may still be in progress — do not report it done
+result = client.{group}.{operation}(...)   # `ref` as its idempotency key, if the operation declares one
+complete(ref, result)
+```
+
+Build `try_claim` on whatever this codebase already uses to enforce uniqueness, and add no new store or
+dependency for it. If it has nothing that can hold such a claim, stop and raise that with the user.
+
+⚠⚠ An in-process lock (`threading.Lock`, `asyncio.Lock`, a module-level dict), a single-process or
+single-host assumption or an exists-then-create read is no guard here: it lets both callers through —
+and documenting it as a known limitation does not change that.
 
 ## Bounding a call — what the timeout actually bounds
 
-One knob, in two places:
+One knob, in two places — and, for async code, a limit on the whole call:
 
 ```python
-client = {Api}Client(timeout=10.0, {scheme}=...)                    # every request
-client.{group}.{operation}(arg, request_options={"timeout": 3.0})   # this one request
+client = {Api}Client(timeout=10.0, {scheme}=...)                    # each wait, every request
+client.{group}.{operation}(arg, request_options={"timeout": 3.0})   # each wait, this one request
+await asyncio.wait_for(async_client.{group}.{operation}(arg), budget)   # the whole call (Async{Api}Client)
 ```
 
 - The value is **seconds, as a float**; the per-call option overrides the client's.
-- It must be **> 0**. The constructor raises `ValueError` otherwise — and rejects NaN too, since the
-  guard is written `not timeout > 0`.
-- The default is **30 seconds**, which is far too long for anything on a user-facing request path. Set
-  it deliberately.
+- It must be **> 0** (NaN is rejected too); the constructor raises `ValueError` otherwise.
+- The default is **30 seconds** per wait.
 - Under the default transport, one float sets connect, read, write and pool timeouts alike. To separate
   them (a short connect, a longer read), build your own transport with an
-  `httpx.Timeout(connect=..., read=...)` and pass it as `custom_http_client`.
+  `httpx2.Timeout(connect=..., read=...)` and pass it as `custom_http_client`.
 
-**Because there are no retries, the timeout genuinely bounds the call.** Worst case is one timeout, not
-attempts × timeout. That simplification is what the no-retry design buys you — and the moment you add
-retries, the arithmetic above becomes yours.
+**The timeout limits each wait, not the whole call.** Connecting, sending and receiving each have their
+own clock, and the receiving clock starts again every time a piece of the reply arrives. So a reply that
+keeps arriving slowly is never cut off, and each attempt — up to `max_retries + 1` of them — can take far
+longer than the number you set. This timeout firing is a transport failure and retries on the curve
+like any other; a `408` is the server's request timeout and sits in the default status set.
 
-**If you supply `custom_http_client`, the client's `timeout=` no longer reaches the wire.** That value
+**If you supply `custom_http_client`, the client's `timeout=` does not reach the wire.** That value
 only builds the SDK's *own* default transport. Set the timeout on the transport you pass, and honour
 `request.timeout` inside it (`python-client-initialization`).
 
-For async callers, a deadline over a whole operation — the SDK call plus your own surrounding work — is
-`asyncio.timeout(...)`. It raises `TimeoutError` through the await, which no `except ApiError` clause
-will catch.
+To limit a whole call, retries included, async code wraps it in `asyncio.wait_for(...)`
+(`asyncio.timeout(...)` needs 3.11, and this SDK supports 3.10); map its `asyncio.TimeoutError` as
+`python-error-handling` shows. Sync code has no whole-call limit through this SDK. A file or
+event-stream call returns at the head, so put the limit around the consuming code too.
 
 ## Proxies and TLS
 
 The default transport takes these directly, and you pass it in yourself to set them:
 
 ```python
-from {root_package}.core import HttpxClient
+from {root_package}.core import Httpx2Client
 
-transport = HttpxClient(timeout=10.0, proxy_url="http://proxy:3128", verify=True)
+transport = Httpx2Client(timeout=10.0, proxy_url="http://proxy:3128", verify=True)
 client = {Api}Client(custom_http_client=transport, {scheme}=...)
 ```
 
@@ -214,44 +250,69 @@ client = {Api}Client(custom_http_client=transport, {scheme}=...)
 - **`verify=False` disables certificate verification.** It is not a debugging convenience for anything
   carrying credentials; fix the trust store instead.
 
-## Logging — wrap the transport
+## Logging — off by default, through the standard logger
 
-There is no logging hook and no event to subscribe to. The transport protocol is the seam: implement
-it, delegate to the real one, and log around the call.
+The SDK writes every HTTP exchange through Python's standard `logging` module under the
+`{root_package}` logger and configures nothing itself: no handler, no level, never the root. Turn it
+on as for any library, or from the environment for a run you cannot edit — `{ROOT_PACKAGE}_LOG` is the
+package name upper-cased with `_LOG` appended:
 
 ```python
-import logging, time
-from {root_package}.core import HttpxClient
+import logging
 
-log = logging.getLogger(__name__)
+logging.basicConfig()                                      # your handler; the root stays at WARNING
+logging.getLogger("{root_package}").setLevel(logging.INFO)  # INFO: the lines; DEBUG: the dumps too
+```
 
-class LoggingTransport:
-    def __init__(self, inner): self._inner = inner
+```bash
+{ROOT_PACKAGE}_LOG=info  python app.py   # the request and response lines
+{ROOT_PACKAGE}_LOG=debug python app.py   # plus request headers, request body and response headers
+```
 
-    def send(self, request):
-        started = time.monotonic()
-        response = self._inner.send(request)
-        log.info(
-            "%s %s -> %s (%.0f ms)",
-            request.method, request.url, response.status_code,
-            (time.monotonic() - started) * 1000,
-        )
-        return response
+| Level | What is written |
+|---|---|
+| `INFO` | `HTTP GET https://api.example.com/items?page=2` as each attempt is sent, and `HTTP GET … -> 200 (12 ms)` when its head arrives |
+| `WARNING` | the response line for any status outside 2xx, and `HTTP GET … retrying in 1.0 s (attempt 1/3): 503 Service Unavailable` before each retry |
+| `ERROR` | `HTTP GET … failed after 6210 ms: ConnectError` when a call ends in an exception, with the exception attached |
+| `DEBUG` | the request headers, the request body and the response headers — each only when its flag below is on |
 
-    def close(self): self._inner.close()
+The dumps are opt-in through `logging_options`, a dict or a `LoggingOptions` from `{root_package}.core`:
 
+```python
 client = {Api}Client(
-    custom_http_client=LoggingTransport(HttpxClient(timeout=10.0)), {scheme}=...
+    logging_options={"log_request_headers": True, "log_response_headers": True, "log_request_body": True},
+    {scheme}=...,
 )
 ```
 
-The async version is the same shape with `async def send` and `async def aclose`.
+| Option | Default | Effect |
+|---|---|---|
+| `log_request_headers` | `False` | the sent headers at DEBUG, masked |
+| `log_response_headers` | `False` | the received headers at DEBUG, masked |
+| `log_request_body` | `False` | the request body at DEBUG: its text when in memory, a description when streamed |
+| `body_size_limit` | `32768` | bytes of a logged body kept before it is cut |
+| `redaction_placeholder` | `"REDACTED"` | what a hidden value prints as |
+| `unmask_headers` / `mask_headers` | none | header names to show, or hide, against the built-in safe list |
+| `mask_keys` | 11 credential names | query and form keys whose values are always hidden; naming a set replaces the default |
 
-**Log the method, URL and status — not headers or bodies.** The auth header carries a live credential
-and bodies carry whatever the API moves; neither belongs in your logs or your traces. If you must
-capture a body to debug, gate it behind a flag that is off by default and redact before writing.
+**What is never printed.** A header value is shown only when its name is on a built-in list of
+standard headers that carry no credential, so `Authorization`, `Cookie` and API-key headers print
+`REDACTED`. A query value is shown only for nine paging names (`cursor`, `limit`, `offset`, `page`,
+`since`, `size` and three more), and a URL's user and password are dropped. A form field under
+`mask_keys` is hidden. A JSON body is printed as sent, so turn `log_request_body` on only where its
+content may be logged. A response body is never logged.
 
-This same wrapper is where OpenTelemetry spans, metrics and request-id propagation belong.
+**One call, quieter.** `request_options={"log_level": logging.WARNING}` is a floor: records below it
+are not written for that call. It never turns on a record the client's options leave off.
+
+**`{ROOT_PACKAGE}_LOG` sets the level and, where no handler listens, adds a stderr one;** `debug`
+also turns the three flags on. An application that configured logging keeps its own handlers and
+format. The SDK never touches the `httpx2` or `httpcore2` loggers; if your root logger is at INFO,
+raise those two to WARNING yourself, or httpx2 prints its own unmasked line per attempt.
+
+**Tracing, metrics and anything the records do not carry** still go on the transport seam: wrap the
+SDK's own transport and delegate (`python-client-initialization` shows the shape). The wrapper sees
+the head only — do not read the body there — and the auth header is live, so never log it yourself.
 
 ### Verify on the wire (first run of any new call)
 
@@ -259,22 +320,19 @@ On success the SDK returns the decoded body and nothing else — never the URL o
 parameter, a header you thought you set, or a query parameter that silently did not serialize produces
 **no in-band signal**; the only symptom is a `404`/`422` that looks like a provider problem.
 
-Run the logging transport the first time you execute any new call, and check:
+Run the first call under `{ROOT_PACKAGE}_LOG=debug`, and check in the request line and header dump:
 
 1. the **method** matches the operation;
 2. the **path** has no unsubstituted `{placeholder}`;
 3. path segments carry **wire values** — an enum's string, not a Python member name;
-4. the **query parameters** you set actually appear.
+4. the **query parameter names** you set appear (a value outside the paging names prints `REDACTED`).
 
-Then gate the wrapper behind a debug flag.
+Then drop the variable.
 
 ## Connection pooling
 
-The client holds one pooled transport. Reuse the client and close it on shutdown; a client per call
-pays a fresh TCP and TLS handshake every time, and under managed auth a fresh token fetch as well.
-Under forking servers (Gunicorn, uWSGI, Celery prefork), construct it **after** the fork — a pool
-inherited across `fork()` is shared by processes that each believe they own it, which surfaces as
-intermittent, unexplainable connection errors. See `python-client-initialization`.
+The client holds one pooled transport. Reuse one client and close it on shutdown; under forking
+servers construct it **after** the fork (`python-client-initialization`).
 
 ## Next
 

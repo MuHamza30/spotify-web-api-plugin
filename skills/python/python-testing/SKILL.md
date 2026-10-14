@@ -1,6 +1,6 @@
 ---
 name: python-testing
-description: Testing code that calls an APIMatic-generated Python SDK — which seam to fake (the transport protocol, or respx at the httpx layer), asserting on the request the SDK actually built, covering the error and decode-failure paths, and keeping tests independent of SDK internals. Load before writing tests for the integration layer.
+description: Load before writing unit or integration tests (pytest or unittest) for code that calls an APIMatic-generated Python SDK. Covers faking the transport protocol, asserting on the request the SDK built, and covering the error, decode, transport and token-fetch failure paths.
 ---
 
 # Testing code that uses an APIMatic Python SDK
@@ -23,16 +23,41 @@ Substitute your own `{Api}Client` and operation names as well.
 ## A reusable stub transport
 
 The transport is a `Protocol`, so a fake needs no base class, no registration and no `Mock` — just
-the two methods:
+its two methods, `send` and `close`. `send` answers with the response **head**; the body stays on
+the stub until something reads it:
 
 ```python
 import json
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, field
 from {root_package}.core import HttpRequest, HttpResponse
+
+@dataclass
+class StubResponse:
+    """A canned head, with the body held as chunks until the SDK reads it."""
+
+    status_code: int = 200
+    headers: Mapping[str, str] = field(default_factory=dict)
+    chunks: list[bytes] = field(default_factory=list)
+    url: str = "https://api.test/resource"
+    closed: bool = False
+
+    def iter_bytes(self, chunk_size: int | None) -> Iterator[bytes]:
+        yield from self.chunks
+        self.close()          # a drained iteration releases the connection; a partial one does not
+
+    def read(self) -> bytes:
+        self.close()          # reading both buffers the body and releases the connection
+        return b"".join(self.chunks)
+
+    def close(self) -> None:
+        self.closed = True
+
 
 class StubTransport:
     """Satisfies the SDK's sync transport protocol: send() + close()."""
 
-    def __init__(self, *responses: HttpResponse) -> None:
+    def __init__(self, *responses: StubResponse) -> None:
         self._responses = list(responses)
         # Every request, in order — the token fetch appends too, so this is what you count.
         self.requests: list[HttpRequest] = []
@@ -44,40 +69,43 @@ class StubTransport:
     def close(self) -> None: ...
 
     @property
-    def last_request(self) -> HttpRequest | None:
-        return self.requests[-1] if self.requests else None
+    def last_request(self) -> HttpRequest:
+        return self.requests[-1]          # IndexError when nothing was sent
 
 
-def json_response(status: int, body: object) -> HttpResponse:
-    return HttpResponse(
+def json_response(status: int, body: object) -> StubResponse:
+    return StubResponse(
         status_code=status,
         headers={"content-type": "application/json"},   # lowercase keys, per the transport contract
-        content=json.dumps(body).encode(),
+        chunks=[json.dumps(body).encode()],
     )
 ```
 
-`HttpResponse` defaults `content` to `b""` and `request` to `None`, so an empty `204` is just
-`HttpResponse(status_code=204, headers={})` — which is what an operation declaring no response body
-expects (`python-calling-endpoints`).
+Assert on `StubResponse.closed` to prove the caller consumed the body and released the connection.
+
+`chunks` defaults to empty, so an empty `204` is just `StubResponse(status_code=204)` — which is what
+an operation declaring no response body expects (`python-calling-endpoints`).
 
 Wire it in and you have a real client with no network:
 
 ```python
-def client_returning(*responses: HttpResponse) -> tuple[{Api}Client, StubTransport]:
+def client_returning(*responses: StubResponse) -> tuple[{Api}Client, StubTransport]:
     transport = StubTransport(*responses)
-    client = {Api}Client(custom_http_client=transport, {scheme}={"...": "..."})
+    # retry_options=0 turns off the default retries (see Notes): one stubbed response, one send.
+    client = {Api}Client(custom_http_client=transport, retry_options=0, {scheme}=...)
     return client, transport
 ```
 
 The keyword is `custom_http_client=` on the sync client and `custom_async_http_client=` on the async
 one; both constructors are keyword-only, and the credential keyword is named after the scheme the
-contract sheet lists.
+contract sheet lists. Its value is that scheme's type: a plain `str` for a bearer token or an API key,
+the credentials model or dict for basic auth or an OAuth grant (`python-authentication`).
 
 **Do not patch the client's private attributes** (`_raw_client`, `_auth`, …) and do not
-`Mock(spec={Api}Client)`. Both couple your tests to internals the generator is free to change, and a
+`Mock(spec={Api}Client)`. Both couple your tests to internals that change without notice, and a
 mocked client cannot catch the mistakes that actually happen — a wrong path parameter, a body that
 does not serialize, a header you forgot. Faking the transport exercises the real request-building
-pipeline; that is the whole point.
+pipeline.
 
 ### The token request comes first
 
@@ -88,7 +116,7 @@ endpoint, not your operation. Two ways to handle it.
 Queue a token response ahead of the operation's, and index from the end:
 
 ```python
-def token_response() -> HttpResponse:
+def token_response() -> StubResponse:
     return json_response(200, {"access_token": "t", "token_type": "Bearer", "expires_in": 3600})
 
 client, transport = client_returning(token_response(), json_response(201, {...}))
@@ -97,19 +125,27 @@ assert len(transport.requests) == 2
 req = transport.last_request          # index from the end, not [0]
 ```
 
-Or bypass acquisition entirely with a stub token source — the generator's supported injection point
-(`python-authentication`) — so the stub transport only ever sees your operation:
+Or bypass acquisition entirely with a stub token source (`python-authentication`), so the stub
+transport only ever sees your operation:
 
 ```python
-from {root_package}.core import OAuthToken
+from {root_package}.core import OAuthTokenRefreshable
 
-class StubTokenSource:
-    def fetch(self, credentials) -> OAuthToken:            # async client: `async def fetch`
-        return OAuthToken(access_token="t", token_type="Bearer")
+# {Credentials} is the type inside your client's `{scheme}_token_source` annotation — for example
+# `ClientCredentials[{Scope}]` — imported the way the client module imports it.
+class StubTokenSource:        # TokenSource and RefreshableTokenSource
+    def fetch(self, credentials: {Credentials}) -> OAuthTokenRefreshable:
+        return OAuthTokenRefreshable(access_token="t", token_type="Bearer")
+    def refresh(self, credentials: {Credentials}, refresh_token: str) -> None: ...  # authorization code needs it
+
+class AsyncStubTokenSource:   # AsyncTokenSource and AsyncRefreshableTokenSource
+    async def fetch(self, credentials: {Credentials}) -> OAuthTokenRefreshable:
+        return OAuthTokenRefreshable(access_token="t", token_type="Bearer")
+    async def refresh(self, credentials: {Credentials}, refresh_token: str) -> None: ...
 
 client = {Api}Client(
     custom_http_client=transport,
-    {scheme}={"...": "..."},                  # still required — the scheme exists only if it is set
+    {scheme}={"...": "..."},   # still required: a valid credential for the grant (`python-authentication`)
     {scheme}_token_source=StubTokenSource(),
 )
 ```
@@ -117,17 +153,20 @@ client = {Api}Client(
 The token is **cached on the scheme**, so only the first call fetches one: a test making two calls
 against one client sees three requests, not four. Forgetting the token request is the most common way
 a first test fails confusingly — the operation's decoder is handed the token body, and you get a
-`ValidationError` about your payload rather than anything mentioning auth.
+`ValidationError` about your payload rather than anything mentioning auth. The tests below queue only
+the operation's response; for OAuth where the SDK fetches the token itself, put `token_response()` first
+(except in the bad-credentials test).
 
 ## Test a success path
 
 ```python
 def test_returns_deserialized_body():
-    client, _ = client_returning(token_response(), json_response(200, {"{wire_field}": "..."}))
+    client, transport = client_returning(json_response(200, {"{wire_field}": "..."}))
 
     value = client.{Group}.{Operation}(...)
 
     assert value.{member} == "..."
+    assert "/{expected/path}" in transport.last_request.url   # the operation, not the token
 ```
 
 ## Test an error path
@@ -145,7 +184,7 @@ from {root_package}.core import ApiError
 from {root_package}.models import {TypedError}
 
 def test_raises_on_api_error():
-    client, _ = client_returning(token_response(), json_response(422, {"...": "..."}))
+    client, transport = client_returning(json_response(422, {"...": "..."}))
 
     with pytest.raises(ApiError) as exc_info:
         client.{Group}.{Operation}(...)
@@ -154,6 +193,7 @@ def test_raises_on_api_error():
     assert e.status_code == 422                    # always present, whichever arm you got
     assert isinstance(e.error, {TypedError})       # narrow before reading fields
     assert e.error.{message_field} == "..."
+    assert "/{expected/path}" in transport.last_request.url   # the operation, not the token
 ```
 
 **`RawError` arm** — a status the operation does not document, which every operation can produce:
@@ -162,43 +202,41 @@ def test_raises_on_api_error():
 from {root_package}.core import RawError
 
 def test_unmapped_status_is_raw():
-    client, _ = client_returning(token_response(), json_response(418, {"whatever": 1}))
+    client, transport = client_returning(json_response(418, {"whatever": 1}))
 
     with pytest.raises(ApiError) as exc_info:
         client.{Group}.{Operation}(...)
 
     assert isinstance(exc_info.value.error, RawError)
     assert exc_info.value.error.status_code == 418
+    assert "/{expected/path}" in transport.last_request.url   # the operation, not the token
     # Body on demand: .text() always, .json() only if you know it is JSON (it raises ValueError).
 ```
 
-**Take the union from the contract sheet per operation.** The typed arm is not one type across the
-API, so an error test copied from a sibling operation can pass for the wrong reason — it lands in the
-`RawError` branch and asserts nothing about the typed body you meant to check. And never assert on
-`str(e)` or `repr(e)`: they render as status plus payload *type name* by design, and are not a stable
-contract.
+**Take each operation's union from its own sheet row** — an error test copied from a sibling
+operation can land in the `RawError` branch and pass for the wrong reason, asserting nothing about the
+typed body you meant to check.
 
 ## Test the result-style (`with_raw_response`) variant
 
-If your code uses the non-raising peer (`python-calling-endpoints`), there is nothing to catch — stub
-the response and assert on the returned `ApiResult` directly. The split is mechanical: **2xx is
-`Success`, everything else is `Failure`**, and both carry `.response`.
+If your code uses the non-raising peer, there is nothing to catch — stub the response and assert on
+the returned `Success` / `Failure` (`python-calling-endpoints`):
 
 ```python
 from {root_package}.core import Failure, Success
 
 def test_raw_response_reports_failure_without_raising():
-    client, _ = client_returning(token_response(), json_response(422, {"...": "..."}))
+    client, transport = client_returning(json_response(422, {"...": "..."}))
 
     result = client.{Group}.with_raw_response.{Operation}(...)
 
     assert isinstance(result, Failure)
     assert isinstance(result.error, {TypedError})       # the same union as the raising path
-    assert result.response.status_code == 422
+    assert result.status_code == 422
+    assert "/{expected/path}" in transport.last_request.url   # the operation, not the token
 ```
 
-`.response` is the only way to read **response headers**, so this is also the mode to test in when
-your code depends on a header on the *success* path (`Success(payload=..., response=...)`).
+Test in this mode when your code reads a header on the *success* path.
 
 ## Assert the outgoing request
 
@@ -206,89 +244,124 @@ your code depends on a header on the *success* path (`Success(payload=..., respo
 actually change:
 
 ```python
+from {root_package}.core import JsonBody
+
 req = transport.last_request
 assert req.method == "POST"
 assert req.url.endswith("/{expected/path}")
 assert "{query_param}=..." in req.url                    # query is part of the URL string
+assert isinstance(req.body, JsonBody) and isinstance(req.body.value, dict)   # narrow before indexing
 assert req.body.value["{wire_field}"] == "..."           # JsonBody carries the dumped payload
 assert req.headers["authorization"] == "Bearer t"        # lowercase key — see below
 assert req.headers["{header}"] == "..."                  # a real default reached the wire
 ```
 
-**`HttpRequest.headers` keys are lowercased, not just the response's.** Every layer — the API's, the
-endpoint's, the auth scheme's and your own `extra_headers` — is normalized before the merge, which is
-exactly what makes the merge case-insensitive. So `req.headers["Authorization"]` is a `KeyError` and
-`req.headers["authorization"]` is the assertion you want. This is the single most common way a first
-request assertion fails confusingly. (The defensive `"authorization" in {k.lower() for k in
-req.headers}` also works, but there is no case to defend against — assert the lowercase key.)
+**`HttpRequest.headers` keys are lowercased**, at every layer — the API's, the endpoint's, the auth
+scheme's and your own `extra_headers` — so assert `req.headers["authorization"]`;
+`req.headers["Authorization"]` is a `KeyError`.
 
 **The body is already serialized by the time a transport sees it.** `req.body` is one of `JsonBody`
-(`.value`, the dumped JSON-safe object), `FormBody` (`.fields`) or `MultipartBody`
-(`.fields` / `.files`) — no transport ever serializes anything — so assert on the dumped value
-directly rather than re-parsing bytes. Note it uses **wire aliases**, because that is what
-serialization produces: if a model's Python name differs from its JSON name, the request body has the
-JSON name. Do not "fix" that in the test.
+(`.value`, the dumped JSON-safe object), `FormBody` (`.fields`), `MultipartBody` (`.parts`, an
+ordered sequence of `MultipartText` and `MultipartFile` — **not** a `.fields`/`.files` pair, and a
+file part's `content` is the unread descriptor you passed, never bytes), `BinaryBody`
+(`.content`, `.media_type`) or `TextBody` (`.text`, `.media_type`, `.charset`). Assert on the dumped
+value directly rather than re-parsing bytes, and expect **wire aliases**: a member whose Python name
+differs from its JSON name is under the JSON name (`python-models`).
 
-**A list-valued query or form parameter has a per-parameter wire format.** The `Param` the generator
-emitted for it in `apis/{controller}.py` carries a `SerializationFormat` — `indexed`
-(`name[0]=a&name[1]=b`, URL-encoded as `name%5B0%5D=a`), `unindexed` (`name[]=a&name[]=b`), `plain`
-(`name=a&name=b`), or `csv` / `tsv` / `psv` (`name=a,b`). Read it before asserting on `req.url`;
-`"name=a" in req.url` is the assertion that fails against an indexed parameter. Path and header
-arrays are not configurable — both fold to one comma-separated value.
+**A list-valued query or form parameter has a per-parameter wire format** — the `SerializationFormat`
+on its `Param` in `apis/{controller}.py`: `indexed` (`name[0]=a&name[1]=b`, URL-encoded as
+`name%5B0%5D=a`), `unindexed` (`name[]=a&name[]=b`), `plain` (`name=a&name=b`), or `csv` / `tsv` /
+`psv` (`name=a,b`). Read it before asserting on `req.url`; `"name=a" in req.url` is the assertion that
+fails against an indexed parameter. Path and header arrays always fold to one comma-separated value.
 
 Worth asserting once, somewhere, because they are silent when wrong:
 
-- **The value actually reached the wire.** Models *preserve* unknown fields rather than rejecting them
-  (`python-models`), so a misspelled optional member becomes a preserved extra field instead of an
-  error. The only thing that catches it is an assertion on the serialized body.
+- **The value actually reached the wire.** A misspelled optional member becomes a preserved extra
+  field, not an error (`python-models`); only an assertion on the serialized body catches it.
 - **Idempotency keys**, on operations that accept one: the same logical operation retried sends the
   *same* value, and two different operations send different ones (`python-configuration-resilience`).
-- **Timeout plumbing.** `req.timeout` reflects a per-call `request_options={"timeout": ...}` and
-  **only** that. The client's own `timeout=` never rides the request — it configures the SDK's default
-  transport — so `req.timeout is None` on an ordinary call is correct, not a bug. A test that asserts
-  the client-level timeout on a captured request is asserting something that was never there; and once
-  you supply a stub transport, the client's `timeout=` reaches nothing at all.
+- **Timeout plumbing.** `req.timeout` carries a per-call `request_options={"timeout": ...}` and
+  **only** that, so it is `None` on an ordinary call. The client's own `timeout=` never rides the
+  request — it configures the SDK's default transport, and with a stub transport it reaches nothing.
 - **Bodies that cannot serialize.** A value the SDK cannot dump raises *before* anything is sent, so
   the failure never reaches your stub and `transport.requests` stays empty. Worth one test where it
   applies (`python-models`).
 
 ## Cover the failures that are not `ApiError`
 
-Three failure kinds never match `except ApiError`, and code that handles only the raised-`ApiError`
-path is the norm (`python-error-handling`). Each is cheap to simulate.
+Three failure kinds never match `except ApiError` (`python-error-handling`); each is cheap to
+simulate.
 
-**A decode failure — and it bypasses *both* response modes.** A body that does not deserialize raises
-`pydantic.ValidationError` (or a plain `ValueError` for a non-JSON body). `with_raw_response` does
-**not** turn it into a `Failure`:
+**A decode failure** raises `pydantic.ValidationError` (or a plain `ValueError` for a non-JSON body) in
+both response modes — `with_raw_response` does **not** turn it into a `Failure`:
 
 ```python
 def test_unreadable_success_body_is_not_reported_as_failure():
     # A real decode failure needs a TYPE mismatch, not an absent member.
-    client, _ = client_returning(token_response(), json_response(200, {"{wire_field}": "not-a-list"}))
-    with pytest.raises(MyProviderUnreadable):
+    client, transport = client_returning(json_response(200, {"{wire_field}": "not-a-list"}))
+    with pytest.raises(ProviderError) as e:
         service.{operation}()
+    assert e.value.outcome_unknown                 # unreadable: may have happened, never "failed"
+    assert "/{expected/path}" in transport.last_request.url   # the operation, not the token
 ```
 
-**A truncated 2xx that decodes cleanly.** Members are required only where the description marks them
-required — often nowhere — so a response missing a member validates fine and reads back `UNSET`. Only
-your own guard catches it, so test the guard:
+**A truncated 2xx that decodes cleanly.** A response missing an optional member validates fine and
+reads back `UNSET` (`python-error-handling`). Only your own guard catches it, so test the guard:
 
 ```python
 def test_truncated_success_body_is_not_reported_as_success():
-    client, _ = client_returning(token_response(), json_response(200, {}))   # no {wire_field}
-    with pytest.raises(MyProviderUnreadable):
+    client, transport = client_returning(json_response(200, {}))   # no {wire_field}
+    with pytest.raises(ProviderError) as e:
         service.{operation}()
+    assert e.value.outcome_unknown                 # unreadable: may have happened, never "failed"
+    assert "/{expected/path}" in transport.last_request.url   # the operation, not the token
 ```
 
 **A transport failure**, which arrives as the HTTP library's own exception, unwrapped — have the stub
-raise instead of answering:
+answer any token response you queue, then raise on the operation's request:
 
 ```python
-def test_transport_failure_is_unknown_outcome():
-    class Boom:
-        def send(self, request): raise httpx.ConnectError("refused")
-        def close(self) -> None: ...
+class RaisingTransport(StubTransport):
+    """Answers the queued responses, then raises `error` on the next send."""
+
+    def __init__(self, error: Exception, *responses: StubResponse) -> None:
+        super().__init__(*responses)
+        self._error = error
+
+    def send(self, request: HttpRequest) -> HttpResponse:
+        if self._responses:                        # a queued token response, if any
+            return super().send(request)
+        self.requests.append(request)
+        raise self._error
+
+
+def client_raising(error: Exception, *responses: StubResponse) -> tuple[{Api}Client, RaisingTransport]:
+    # Pass token_response() only for OAuth where the SDK fetches the token itself (no
+    # {scheme}_token_source); never for bearer, API key or basic auth.
+    transport = RaisingTransport(error, *responses)
+    return {Api}Client(custom_http_client=transport, retry_options=0, {scheme}=...), transport
+
+
+def test_refused_connection_is_a_known_outcome():
+    client, transport = client_raising(httpx2.ConnectError("refused"))        # never sent
+    with pytest.raises(ProviderError) as e:
+        service.{operation}()
+    assert (e.value.status_code, e.value.outcome_unknown) == (502, False)
+    assert "/{expected/path}" in transport.last_request.url              # the operation, not the token
+
+
+def test_read_timeout_is_an_unknown_outcome():
+    client, transport = client_raising(httpx2.ReadTimeout("no reply"))        # may have landed
+    with pytest.raises(ProviderError) as e:
+        service.{operation}()
+    assert (e.value.status_code, e.value.outcome_unknown) == (504, True)
+    assert "/{expected/path}" in transport.last_request.url              # the operation, not the token
 ```
+
+Test both inputs and expect **different** values: a test of only one, or two that one assertion
+satisfies, cannot tell a never-sent failure from one that may have landed. When the SDK fetches a
+token, let the token request through first — a failure *there* means your operation was never sent at
+all.
 
 And the one people forget: **bad credentials**. A failed token fetch raises `ApiError` too, but its
 payload is `OAuthProviderError | RawError` — *not* the operation's union — and it surfaces out of the
@@ -298,59 +371,71 @@ configuration error, not a rejection error:
 ```python
 def test_bad_credentials_is_a_config_error():
     client, _ = client_returning(json_response(401, {"error": "invalid_client"}))   # no token_response()
-    with pytest.raises(MyProviderConfigError):
+    with pytest.raises(ProviderError) as e:
         service.{operation}()
+    assert e.value.status_code == 502              # our credentials: never the caller's 401
 ```
 
 ## Async tests
 
-Same seam, async shape — `async def send`, and `aclose` rather than `close`:
+Same seam, async shape — `async def send`, and `aclose` rather than `close`. The async client reads
+the response with `aiter_bytes`, `aread` and `aclose`, so queue an `AsyncStubResponse`, never a
+`StubResponse`:
 
 ```python
+from collections.abc import AsyncIterator
+from {root_package}.core import AsyncHttpResponse, HttpRequest
+
+@dataclass
+class AsyncStubResponse:
+    status_code: int = 200
+    headers: Mapping[str, str] = field(default_factory=dict)
+    chunks: list[bytes] = field(default_factory=list)
+    url: str = "https://api.test/resource"
+    closed: bool = False
+
+    async def aiter_bytes(self, chunk_size: int | None) -> AsyncIterator[bytes]:
+        for chunk in self.chunks:
+            yield chunk
+        self.closed = True
+
+    async def aread(self) -> bytes:
+        self.closed = True
+        return b"".join(self.chunks)
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def async_json_response(status: int, body: object) -> AsyncStubResponse:
+    return AsyncStubResponse(
+        status_code=status,
+        headers={"content-type": "application/json"},
+        chunks=[json.dumps(body).encode()],
+    )
+
+
 class StubAsyncTransport:
-    def __init__(self, *responses): self._responses = list(responses); self.requests = []
-    async def send(self, request):
+    def __init__(self, *responses: AsyncStubResponse) -> None:
+        self._responses = list(responses)
+        self.requests: list[HttpRequest] = []
+    async def send(self, request: HttpRequest) -> AsyncHttpResponse:
         self.requests.append(request)
         return self._responses.pop(0)
     async def aclose(self) -> None: ...
+    @property
+    def last_request(self) -> HttpRequest:
+        return self.requests[-1]
 
 @pytest.mark.asyncio
 async def test_operation():
-    client = Async{Api}Client(custom_async_http_client=StubAsyncTransport(...), {scheme}=...)
+    transport = StubAsyncTransport(async_json_response(200, {...}))
+    client = Async{Api}Client(custom_async_http_client=transport, retry_options=0, {scheme}=...)
 ```
 
 Use `pytest-asyncio` or `anyio`, whichever the project already uses. The type checker rejects a sync
 stub passed to the async client and vice versa, which is a genuine safety net — do not silence it with
 a `# type: ignore`.
-
-## The alternative: `respx`
-
-Because the SDK's default transport is httpx, `respx` mocks at the HTTP layer and needs no injection —
-your production code constructs its client unmodified:
-
-```python
-import respx, httpx
-
-@respx.mock
-def test_operation():
-    respx.post("{base_url}{token_path}").mock(
-        return_value=httpx.Response(200, json={"access_token": "t", "token_type": "Bearer"})
-    )
-    route = respx.post("{base_url}{operation_path}").mock(
-        return_value=httpx.Response(201, json={"{wire_field}": "..."})
-    )
-
-    service.{operation}()                       # production code, unmodified
-
-    assert route.called
-    assert json.loads(route.calls.last.request.content)["{wire_field}"] == "..."
-```
-
-Pick one and be consistent. `respx` asserts on real URLs and is closer to the wire; the stub transport
-is dependency-free, faster, and keeps working if the SDK ever changes HTTP library. Use `respx` when
-you want URL-level matching, the stub when you are unit-testing your own logic. Note `respx` only
-works while the default transport is in play — it cannot see a call made through a
-`custom_http_client` you supplied.
 
 ## Keeping tests independent of SDK internals
 
@@ -365,9 +450,8 @@ works while the default transport is in play — it cannot see a call made throu
   derives its payload from the model's own definition cannot detect a wrong payload.
 - **Build fixtures with models, then serialize** — `{request_fixture}().to_dict()` — rather than
   hand-writing wire JSON, so a member rename fails the fixture instead of passing a stale test.
-- **Test your own boundary's output, not the SDK's.** The valuable assertions are that a provider 4xx
-  becomes your 4xx and a transport failure becomes your 5xx. That the SDK raises `ApiError` on a 422
-  is the SDK's own tested behaviour, not yours.
+- **Test your own boundary's output** — the `provider_error` mapping in `python-error-handling` — not
+  that the SDK raises `ApiError` on a 422, which is the SDK's own tested behaviour.
 
 ## Integration tests against a live environment
 
@@ -378,27 +462,35 @@ assert on ids or timestamps the provider generates:
 @pytest.mark.integration
 @pytest.mark.skipif(not os.getenv("{API}_CLIENT_ID"), reason="sandbox credentials not configured")
 def test_real_{operation}():
-    with {Api}Client({scheme}=..., base_url={sandbox_url}, timeout=15.0) as client:
+    with {Api}Client({scheme}=..., {server_keyword}={sandbox}, timeout=15.0) as client:
         value = client.{Group}.{Operation}(...)
         assert value.{member}
 ```
 
 Point them at the sandbox/test environment **explicitly** rather than relying on the default, so the
-test states which environment it needs. Expect flakiness from the provider, not from your code, and
+test states which environment it needs. `{server_keyword}` is `environment=` wherever the client has
+one, else `base_url=` or `server_config=`, with the value shaped as the table in
+`python-configuration-resilience` shows. Expect flakiness from the provider, not from your code, and
 never gate CI on a third party's uptime unless you mean to.
 
 ## Notes
 
-- **The SDK performs no retries**, so a stubbed `429`/`503` is seen exactly once and your stub's queue
-  needs exactly one response for it. If your code adds its own retry layer
-  (`python-configuration-resilience`), that is *your* code under test: queue the responses each
-  attempt should get and count `transport.requests`.
-- **A `401` invalidates the cached token but does not retry the request.** A test that stubs a `401`
-  therefore sees one failed operation — and the *next* call in the same test re-fetches a token, so
-  queue another `token_response()` for it.
+- **Retries are on by default**, so a stubbed `429`/`503` on a `GET`, `HEAD`, `PUT` or `OPTIONS` call is
+  sent up to four times, with real backoff waits between them. Build test clients with
+  `retry_options=0` so one stubbed response is seen exactly once. In a test *about* retrying, set a
+  policy with `initial_delay` and `max_jitter` small, queue one response per attempt and count
+  `transport.requests`. For the loop to retry a
+  *transport* failure the fake must raise `TransportError` from `{root_package}.core` — a
+  bare `httpx2.ConnectError` bypasses the loop and reaches the test on the first attempt
+  (`python-configuration-resilience`).
+- A stubbed `401` fails one operation and the *next* call re-fetches a token
+  (`python-authentication`), so queue another `token_response()` for it.
 - Mocking libraries (`unittest.mock`, `pytest-mock`) work too — the protocol is structural, so a
-  `Mock()` with `send`/`close` configured satisfies it. The hand-written stub above gives you typed
-  captured requests and ordered responses for free.
+  `Mock()` with `send` and `close` configured satisfies it. The hand-written stub above gives you
+  typed captured requests and ordered responses for free.
+- **A download** is the same `StubResponse`, wrapped in the `FileResponse` your code sees; give it
+  `chunks` if the test drives `iter_bytes`. Making an abandoned download's `ResourceWarning` fail a
+  test is in `python-file-handling`.
 - **Use the client as a context manager or close it** in tests as in production; a stub's `close()` is
   a no-op, but the habit keeps the test and the real wiring the same shape
   (`python-client-initialization`).
